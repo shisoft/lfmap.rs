@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::mem;
 use std::ptr;
 use core::intrinsics;
+use std::thread;
+use std::sync::Arc;
 
 #[test]
 fn prim_test () {
@@ -37,6 +39,17 @@ fn resize () {
             Some(r) => assert_eq!(r, i * 2),
             None => panic!("{}, {}", i, map.capacity())
         }
+    }
+}
+
+#[test]
+fn parallel() {
+    let map = Arc::new(lfmap::HashMap::<u32, u32>::new());
+    for i in 0..3 {
+        let map = map.clone();
+        thread::spawn(move || {
+            map.get(123);
+        });
     }
 }
 
