@@ -4,7 +4,6 @@ extern crate LFMap;
 extern crate libc;
 extern crate core;
 
-use std::collections::hash_map::RandomState;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::mem;
 use std::ptr;
@@ -12,7 +11,7 @@ use core::intrinsics;
 
 #[test]
 fn prim_test () {
-    let map = LFMap::i32_kv::HashMap::<RandomState>::new();
+    let map = LFMap::HashMap::<u32, u32>::new();
     map.insert(123, 456);
     map.insert(789, 101112);
     assert_eq!(map.get(123).unwrap(), 456);
