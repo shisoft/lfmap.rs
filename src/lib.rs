@@ -1,7 +1,9 @@
 #![feature(integer_atomics)]
 #![feature(box_syntax)]
+#![feature(core_intrinsics)]
 
 extern crate libc;
+extern crate core;
 
 use std::hash::{BuildHasher, Hasher, BuildHasherDefault, Hash};
 
@@ -49,13 +51,14 @@ pub fn num_from_tag(tag: &EntryTag) -> u8 {
 
 macro_rules! defmap {
     (
-        $($m:ident,$k: ty, $v: ty, $av: ident);*
+        $($m:ident,$k: ty, $v: ty);*
     ) =>
     (
         $(
             pub mod $m {
 
-                use std::sync::atomic::*;
+
+                use core::intrinsics;
                 use std::marker::PhantomData;
                 use std::mem;
                 use libc;
@@ -79,17 +82,11 @@ macro_rules! defmap {
                 }
 
                 impl Entry {
-                    pub fn get_val_atomic(&self, mem_ptr: u64) -> $av {
-                        unsafe {
-                            let kl = mem::size_of::<$k>() as u64;
-                            ptr::read((mem_ptr + kl) as *mut $av)
-                        }
-                    }
                     pub fn from(mem_ptr: u64) -> Option<Entry> {
                         unsafe {
                             let mem_ptr = mem_ptr as usize;
                             let kl = mem::size_of::<$k>();
-                            let vl = mem::size_of::<$av>();
+                            let vl = mem::size_of::<$v>();
                             let tag = ptr::read((mem_ptr + kl + vl) as *mut u8);
                             if tag == 0 {
                                 None
@@ -103,19 +100,47 @@ macro_rules! defmap {
                             }
                         }
                     }
+                    pub fn compare_and_swap(ptr: u64, old: $v, new: $v) -> $v {
+                        let kl = mem::size_of::<$k>() as u64;
+                        unsafe {
+                            let (val, ok) = intrinsics::atomic_cxchg_relaxed((ptr + kl) as *mut $v, old, new);
+                            val
+                        }
+                    }
+                    pub fn load_val(ptr: u64) -> $v {
+                        let kl = mem::size_of::<$k>() as u64;
+                        unsafe {
+                            intrinsics::atomic_load_relaxed((ptr + kl) as *mut $v)
+                        }
+                    }
+                    pub fn compare_and_swap_to(ptr: u64, new: $v) -> $v {
+                        let kl = mem::size_of::<$k>();
+                        let ptr = ptr + kl as u64;
+                        unsafe {
+                            let mut old = intrinsics::atomic_load_relaxed(ptr as *mut $v);
+                            loop {
+                                let (val, ok) = intrinsics::atomic_cxchg_relaxed(ptr as *mut $v, old, new);
+                                if ok {
+                                    return old;
+                                } else {
+                                    old = val;
+                                }
+                            }
+                        }
+                    }
                     pub fn to(&self, mem_ptr: u64, init: $v) {
                         unsafe {
                             let mem_ptr = mem_ptr as usize;
                             let kl = mem::size_of::<$k>();
                             Entry::set_tag(mem_ptr, &self.tag);
                             ptr::write(mem_ptr as *mut $k, self.key);
-                            ptr::write((mem_ptr + kl) as *mut $av, $av::new(init));
+                            ptr::write((mem_ptr + kl) as *mut $v, init);
                         }
                     }
                     pub fn set_tag(mem_ptr: usize, tag: &EntryTag) {
                         let mem_ptr = mem_ptr;
                         let kl = mem::size_of::<$k>();
-                        let vl = mem::size_of::<$av>();
+                        let vl = mem::size_of::<$v>();
                         unsafe {
                             ptr::write((mem_ptr + kl + vl) as *mut u8, num_from_tag(tag));
                         }
@@ -126,7 +151,7 @@ macro_rules! defmap {
                 {
                     pub fn with_options(opts: Options<H>) -> HashMap<H> {
                        let kl = mem::size_of::<$k>();
-                       let vl = mem::size_of::<$av>();
+                       let vl = mem::size_of::<$v>();
                        let tl = mem::size_of::<u8>();
                        let entry_size = kl + vl + tl;
                        let table_size = entry_size * opts.capacity as usize;
@@ -155,11 +180,7 @@ macro_rules! defmap {
                                    if entry.key != k {
                                        slot += 1;
                                    } else {
-                                       let av = entry.get_val_atomic(ptr);
-                                       let mut old = av.load(Ordering::Relaxed);
-                                       while av.compare_and_swap(old, v, Ordering::Relaxed) != old {
-                                           old = av.load(Ordering::Relaxed);
-                                       }
+                                       let old = Entry::compare_and_swap_to(ptr, v);
                                        Entry::set_tag(ptr as usize, &EntryTag::LIVE);
                                        return Some(old)
                                    }
@@ -187,11 +208,10 @@ macro_rules! defmap {
                                    if entry.key != k {
                                        slot += 1;
                                    } else {
-                                       let av = entry.get_val_atomic(ptr);
                                        return {
                                             match entry.tag {
                                                 EntryTag::Empty => None,
-                                                EntryTag::LIVE => Some(av.load(Ordering::Relaxed)),
+                                                EntryTag::LIVE => Some(Entry::load_val(ptr)),
                                                 EntryTag::DEAD => None,
                                                 EntryTag::MOVED => None,
                                             }
@@ -218,13 +238,13 @@ macro_rules! defmap {
 }
 
 defmap!(
-    u8_kv, u8, u8, AtomicU8;
-    u16_kv, u16, u16, AtomicU16;
-    u32_kv, u32, u32, AtomicU32;
-    u64_kv, u64, u64, AtomicU64;
+    u8_kv, u8, u8;
+    u16_kv, u16, u16;
+    u32_kv, u32, u32;
+    u64_kv, u64, u64;
 
-    i8_kv, i8, i8, AtomicI8;
-    i16_kv, i16, i16, AtomicI16;
-    i32_kv, i32, i32, AtomicI32;
-    i64_kv, i64, i64, AtomicI64
+    i8_kv, i8, i8;
+    i16_kv, i16, i16;
+    i32_kv, i32, i32;
+    i64_kv, i64, i64
 );
