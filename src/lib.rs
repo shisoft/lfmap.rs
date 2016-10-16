@@ -169,7 +169,7 @@ impl <K, V, H> HashMap<K, V, H>
     pub fn new() -> HashMap<K, V> {
         HashMap::with_options(Options::default())
     }
-    pub fn insert(&self, k: K, v: V) -> Option<V> {
+    fn find(&self, k: K) -> (Option<Entry<K, V>>, u64) {
         let hash = self.hash(&k);
         let mut slot = self.table_slot(&hash);
         loop {
@@ -180,48 +180,45 @@ impl <K, V, H> HashMap<K, V, H>
                     if entry.key != k {
                         slot += 1;
                     } else {
-                        let old = Entry::<K, V>::compare_and_swap_to(ptr, v);
-                        Entry::<K, V>::set_tag(ptr as usize, &EntryTag::LIVE);
-                        return Some(old)
+                        return (Some(entry), ptr)
                     }
                 },
-                None => {
-                    let entry = Entry {
-                        key: k,
-                        tag: EntryTag::LIVE,
+                None => return (None, ptr)
+            }
+        };
+    }
+    pub fn insert(&self, k: K, v: V) -> Option<V> {
+        let (entry, ptr) = self.find(k);
+        match entry {
+            Some(entry) => {
+                let old = Entry::<K, V>::compare_and_swap_to(ptr, v);
+                Entry::<K, V>::set_tag(ptr as usize, &EntryTag::LIVE);
+                return Some(old)
+            },
+            None => {
+                let entry = Entry {
+                    key: k,
+                    tag: EntryTag::LIVE,
 
-                        vp: PhantomData
-                    };
-                    entry.to(ptr, v);
-                    break;
-                }
+                    vp: PhantomData
+                };
+                entry.to(ptr, v);
+                None
             }
         }
-        None
     }
     pub fn get(&self, k: K) -> Option<V> {
-        let hash = self.hash(&k);
-        let mut slot = self.table_slot(&hash);
-        loop {
-            let ptr = self.table_addr + slot * self.entry_size;
-            let entry = Entry::<K, V>::new_from(ptr);
-            match entry {
-                Some(entry) => {
-                    if entry.key != k {
-                        slot += 1;
-                    } else {
-                        return {
-                            match entry.tag {
-                                EntryTag::Empty => None,
-                                EntryTag::LIVE => Some(Entry::<K, V>::load_val(ptr)),
-                                EntryTag::DEAD => None,
-                                EntryTag::MOVED => None,
-                            }
-                        }
-                    }
-                },
-                None => return None
+        let (entry, ptr) = self.find(k);
+        match entry {
+            Some(entry) => {
+                match entry.tag {
+                    EntryTag::Empty => None,
+                    EntryTag::LIVE => Some(Entry::<K, V>::load_val(ptr)),
+                    EntryTag::DEAD => None,
+                    EntryTag::MOVED => None,
+                }
             }
+            None => None
         }
     }
     fn hash<Q: ?Sized>(&self, key: &Q) -> u64
