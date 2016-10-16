@@ -17,7 +17,9 @@ fn prim_test () {
     assert_eq!(map.get(123).unwrap(), 456);
     assert_eq!(map.get(789).unwrap(), 101112);
     map.insert(123, 123);
-    //assert_eq!(map.get(123).unwrap(), 123);
+    assert_eq!(map.get(123).unwrap(), 123);
+    assert_eq!(map.remove(123).unwrap(), 123);
+    assert!(map.get(123).is_none());
 }
 
 #[test]

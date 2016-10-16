@@ -220,6 +220,23 @@ impl <K, V, H> HashMap<K, V, H>
             None => None
         }
     }
+    pub fn remove(&self, k: K) -> Option<V> {
+        let (entry, ptr) = self.find(k);
+        match entry {
+            Some(entry) => {
+                match entry.tag {
+                    EntryTag::LIVE => {
+                        Entry::<K, V>::set_tag(ptr as usize, &EntryTag::DEAD);
+                        Some(Entry::<K, V>::load_val(ptr))
+                    },
+                    EntryTag::Empty => None,
+                    EntryTag::DEAD => None,
+                    EntryTag::MOVED => None,
+                }
+            }
+            None => None
+        }
+    }
 
     fn hash<Q: ?Sized>(&self, key: &Q) -> u64
         where K: Borrow<Q> + Hash + Eq, Q: Hash {
