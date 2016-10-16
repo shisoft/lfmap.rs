@@ -1,4 +1,3 @@
-#![feature(box_syntax)]
 #![feature(core_intrinsics)]
 
 extern crate libc;
@@ -95,11 +94,10 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
             }
         }
     }
-    pub fn compare_and_swap(ptr: u64, old: V, new: V) -> V {
+    pub fn compare_and_swap(ptr: u64, old: V, new: V) -> (V, bool) {
         let kl = mem::size_of::<K>() as u64;
         unsafe {
-            let (val, _) = intrinsics::atomic_cxchg_relaxed((ptr + kl) as *mut V, old, new);
-            val
+            intrinsics::atomic_cxchg_relaxed((ptr + kl) as *mut V, old, new)
         }
     }
     pub fn load_val(ptr: u64) -> V {
@@ -190,8 +188,8 @@ impl <K, V, H> HashMap<K, V, H>
         let (entry, ptr) = self.find(k);
         match entry {
             Some(_) => {
-                let old = Entry::<K, V>::compare_and_swap_to(ptr, v);
                 Entry::<K, V>::set_tag(ptr as usize, &EntryTag::LIVE);
+                let old = Entry::<K, V>::compare_and_swap_to(ptr, v);
                 return Some(old)
             },
             None => {
@@ -237,7 +235,29 @@ impl <K, V, H> HashMap<K, V, H>
             None => None
         }
     }
-
+    pub fn compute<U: Fn(K, V) -> V>(&self, k: K, compute_val: U) -> Option<V> {
+        let (entry, ptr) = self.find(k);
+        match entry {
+            Some(entry) => {
+                match entry.tag {
+                    EntryTag::LIVE => {
+                        let old = Entry::<K, V>::load_val(ptr);
+                        loop {
+                            let new = compute_val(k, old);
+                            let (_, ok) = Entry::<K, V>::compare_and_swap(ptr, old, new);
+                            if ok {
+                                return Some(new)
+                            }
+                        }
+                    },
+                    EntryTag::Empty => None,
+                    EntryTag::DEAD => None,
+                    EntryTag::MOVED => None,
+                }
+            }
+            None => None
+        }
+    }
     fn hash<Q: ?Sized>(&self, key: &Q) -> u64
         where K: Borrow<Q> + Hash + Eq, Q: Hash {
         let mut hasher = self.hasher_factory.build_hasher();
