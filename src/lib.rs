@@ -82,19 +82,20 @@ pub struct Entry<K, V> where K: Copy, V: Copy {
 }
 
 impl <K, V> Entry<K, V> where K: Copy, V: Copy {
-    pub fn new_from(mem_ptr: u64) -> Option<Entry<K, V>> {
+    pub fn new_from(ptr: u64) -> Option<Entry<K, V>> {
         unsafe {
-            let mem_ptr = mem_ptr as usize;
+            let ptr = ptr as usize;
             let kl = mem::size_of::<K>();
             let vl = mem::size_of::<V>();
-            let tag = intrinsics::atomic_load_relaxed((mem_ptr + kl + vl) as *mut u8);
+            let tag_ptr = ptr + kl + vl;
+            let tag = intrinsics::atomic_load(tag_ptr as *mut u8);
             if tag == 0 {
                 None
             } else {
                 Some(
                     Entry {
                         tag: tag_from_num(tag),
-                        key: ptr::read(mem_ptr as *mut K),
+                        key: ptr::read(ptr as *mut K),
 
                         vp: PhantomData
                     }
@@ -105,22 +106,22 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
     pub fn compare_and_swap(ptr: u64, old: V, new: V) -> (V, bool) {
         let kl = mem::size_of::<K>() as u64;
         unsafe {
-            intrinsics::atomic_cxchg_relaxed((ptr + kl) as *mut V, old, new)
+            intrinsics::atomic_cxchg_acqrel((ptr + kl) as *mut V, old, new)
         }
     }
     pub fn load_val(ptr: u64) -> V {
         let kl = mem::size_of::<K>() as u64;
         unsafe {
-            intrinsics::atomic_load_relaxed((ptr + kl) as *mut V)
+            intrinsics::atomic_load((ptr + kl) as *mut V)
         }
     }
     pub fn compare_and_swap_to(ptr: u64, new: V) -> V {
         let kl = mem::size_of::<K>();
         let ptr = ptr + kl as u64;
         unsafe {
-            let mut old = intrinsics::atomic_load_relaxed(ptr as *mut V);
+            let mut old = intrinsics::atomic_load(ptr as *mut V);
             loop {
-                let (val, ok) = intrinsics::atomic_cxchg_relaxed(ptr as *mut V, old, new);
+                let (val, ok) = intrinsics::atomic_cxchg_acqrel(ptr as *mut V, old, new);
                 if ok {
                     return old;
                 } else {
@@ -143,7 +144,7 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
         let vl = mem::size_of::<V>();
         let tag_ptr = ptr + kl + vl;
         unsafe {
-            intrinsics::atomic_store_relaxed(tag_ptr as *mut u8, num_from_tag(tag))
+            intrinsics::atomic_store(tag_ptr as *mut u8, num_from_tag(tag))
         }
     }
     pub fn cas_tag(ptr: usize, old: &EntryTag, new: &EntryTag) -> (EntryTag, bool) {
@@ -153,7 +154,7 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
         let old_byte = num_from_tag(old);
         let new_byte = num_from_tag(new);
         unsafe {
-            let (val, ok) = intrinsics::atomic_cxchg_relaxed(tag_ptr as *mut u8, old_byte, new_byte);
+            let (val, ok) = intrinsics::atomic_cxchg_acqrel(tag_ptr as *mut u8, old_byte, new_byte);
             (tag_from_num(val), ok)
         }
     }
@@ -192,14 +193,14 @@ impl <K, V, H> HashMap<K, V, H>
     }
     fn find(&self, k: K, table: &Table) -> (Option<Entry<K, V>>, u64) {
         let hash = self.hash(&k);
-        let mut slot = self.table_slot(&hash, table) % table.capacity;
+        let mut slot = self.table_slot(&hash, table);
         loop {
             let ptr = table.addr + slot * self.entry_size;
             let entry = Entry::<K, V>::new_from(ptr);
             match entry {
                 Some(entry) => {
                     if entry.key != k {
-                        slot += 1;
+                        slot = self.table_slot(&(slot + 1), table);
                     } else {
                         return (Some(entry), ptr)
                     }
@@ -214,7 +215,7 @@ impl <K, V, H> HashMap<K, V, H>
         self.prev_table = Table{
             addr: self.curr_table.addr,
             capacity: self.curr_table.capacity,
-            contained: AtomicU64::new(self.curr_table.contained.load(Ordering::Relaxed))
+            contained: AtomicU64::new(self.curr_table.contained.load(Ordering::SeqCst))
         };
         self.curr_table = Table{
             addr: new_addr,
@@ -241,7 +242,7 @@ impl <K, V, H> HashMap<K, V, H>
             libc::free(self.prev_table.addr as *mut libc::c_void);
         }
         self.prev_table = Table{addr: 0, capacity: 0, contained: AtomicU64::new(0)};
-        self.resizing.swap(false, Ordering::Relaxed);
+        self.resizing.swap(false, Ordering::SeqCst);
     }
     fn put_new_entry(k: K, v: V, ptr: u64) {
         let entry = Entry {
@@ -262,7 +263,7 @@ impl <K, V, H> HashMap<K, V, H>
         }
     }
     pub fn insert(&mut self, k: K, v: V) -> Option<V> {
-        if self.curr_table.contained.load(Ordering::Relaxed) > self.curr_table.capacity / 2 {
+        if self.curr_table.contained.load(Ordering::SeqCst) > self.curr_table.capacity / 2 {
             self.resize();
         }
         let (entry, ptr) = self.find(k, &self.curr_table);
@@ -280,32 +281,30 @@ impl <K, V, H> HashMap<K, V, H>
             }
         };
         self.set_entry_moved(k);
-        self.curr_table.contained.fetch_add(1, Ordering::Relaxed);
+        self.curr_table.contained.fetch_add(1, Ordering::SeqCst);
         result
     }
     fn is_resizing(&self) -> bool {
-        self.resizing.load(Ordering::Relaxed)
+        self.resizing.load(Ordering::SeqCst)
     }
     fn get_from_entry_ptr(&self, entry: Option<Entry<K, V>>, ptr: u64) -> Option<V> {
         match entry {
             Some(entry) => {
                 match entry.tag {
-                    EntryTag::Empty => None,
                     EntryTag::LIVE => Some(Entry::<K, V>::load_val(ptr)),
-                    EntryTag::DEAD => None,
-                    EntryTag::MOVED => None,
+                    _ => None,
                 }
             },
             None => None
         }
     }
     pub fn get(&self, k: K) -> Option<V> {
+        let read_current = || {
+            let (entry, ptr) = self.find(k, &self.curr_table);
+            self.get_from_entry_ptr(entry, ptr)
+        };
         if self.is_resizing() {
             let (prev_entry, prev_ptr) = self.find(k, &self.prev_table);
-            let read_current = || {
-                let (entry, ptr) = self.find(k, &self.curr_table);
-                self.get_from_entry_ptr(entry, ptr)
-            };
             match prev_entry {
                 None => read_current(),
                 Some(prev_entry) => {
@@ -319,8 +318,7 @@ impl <K, V, H> HashMap<K, V, H>
                 }
             }
         } else {
-            let (entry, ptr) = self.find(k, &self.curr_table);
-            self.get_from_entry_ptr(entry, ptr)
+            read_current()
         }
     }
     pub fn remove(&self, k: K) -> Option<V> {

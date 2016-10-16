@@ -29,10 +29,10 @@ fn prim_test () {
 #[test]
 fn resize () {
     let mut map = lfmap::HashMap::<u32, u32>::new();
-    for i in 0..4096 {
+    for i in 0..2048 {
         map.insert(i, i * 2);
     }
-    for i in 0..4096 {
+    for i in 0..2048 {
         match map.get(i) {
             Some(r) => assert_eq!(r, i * 2),
             None => panic!("{}, {}", i, map.capacity())
