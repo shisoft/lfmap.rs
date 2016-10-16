@@ -1,11 +1,10 @@
-#![feature(integer_atomics)]
 #![feature(box_syntax)]
 #![feature(core_intrinsics)]
 
 extern crate libc;
 extern crate core;
 
-use std::hash::{BuildHasher, Hasher, BuildHasherDefault, Hash};
+use std::hash::{BuildHasher, Hasher, Hash};
 use core::intrinsics;
 use std::marker::{PhantomData, Copy};
 use std::mem;
@@ -99,7 +98,7 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
     pub fn compare_and_swap(ptr: u64, old: V, new: V) -> V {
         let kl = mem::size_of::<K>() as u64;
         unsafe {
-            let (val, ok) = intrinsics::atomic_cxchg_relaxed((ptr + kl) as *mut V, old, new);
+            let (val, _) = intrinsics::atomic_cxchg_relaxed((ptr + kl) as *mut V, old, new);
             val
         }
     }
@@ -190,7 +189,7 @@ impl <K, V, H> HashMap<K, V, H>
     pub fn insert(&self, k: K, v: V) -> Option<V> {
         let (entry, ptr) = self.find(k);
         match entry {
-            Some(entry) => {
+            Some(_) => {
                 let old = Entry::<K, V>::compare_and_swap_to(ptr, v);
                 Entry::<K, V>::set_tag(ptr as usize, &EntryTag::LIVE);
                 return Some(old)
@@ -221,6 +220,7 @@ impl <K, V, H> HashMap<K, V, H>
             None => None
         }
     }
+
     fn hash<Q: ?Sized>(&self, key: &Q) -> u64
         where K: Borrow<Q> + Hash + Eq, Q: Hash {
         let mut hasher = self.hasher_factory.build_hasher();
