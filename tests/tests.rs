@@ -1,6 +1,6 @@
 #![feature(core_intrinsics)]
 
-extern crate LFMap;
+extern crate lfMap;
 extern crate libc;
 extern crate core;
 
@@ -11,7 +11,7 @@ use core::intrinsics;
 
 #[test]
 fn prim_test () {
-    let map = LFMap::HashMap::<u32, u32>::new();
+    let map = lfMap::HashMap::<u32, u32>::new();
     map.insert(123, 456);
     map.insert(789, 101112);
     assert_eq!(map.get(123).unwrap(), 456);

@@ -1,8 +1,7 @@
 [package]
-name = "LFMap"
+name = "lfMap"
 version = "0.1.0"
 authors = ["Jack Shi <shisoftgenius@gmail.com>"]
 
 [dependencies]
 libc = "*"
-enum_primitive = "*"
