@@ -86,6 +86,9 @@ pub struct HashMap<K, V, H = RandomState>
     prev_table: AtomicU64,
     entry_size: u64,
 
+    kl: u64,
+    vl: u64,
+
     resizing: AtomicBool,
 
     kp: PhantomData<K>,
@@ -100,11 +103,9 @@ pub struct Entry<K, V> where K: Copy, V: Copy {
 }
 
 impl <K, V> Entry<K, V> where K: Copy, V: Copy {
-    pub fn new_from(ptr: u64) -> Option<Entry<K, V>> {
+    pub fn new_from(ptr: u64, kl: u64, vl: u64) -> Option<Entry<K, V>> {
         unsafe {
-            let ptr = ptr as usize;
-            let kl = mem::size_of::<K>();
-            let vl = mem::size_of::<V>();
+            let ptr = ptr as u64;
             let tag_ptr = ptr + kl + vl;
             let tag = intrinsics::atomic_load(tag_ptr as *mut u8);
             if tag == 0 {
@@ -199,6 +200,9 @@ impl <K, V, H> HashMap<K, V, H>
             hasher_factory: opts.hasher_factory,
             entry_size: entry_size as u64,
 
+            kl: kl as u64,
+            vl: vl as u64,
+
             resizing: AtomicBool::new(false),
 
             kp: PhantomData,
@@ -214,7 +218,7 @@ impl <K, V, H> HashMap<K, V, H>
         let mut slot = self.table_slot(&hash, &table);
         loop {
             let ptr = table.addr + slot * self.entry_size;
-            let entry = Entry::<K, V>::new_from(ptr);
+            let entry = Entry::<K, V>::new_from(ptr, self.kl, self.vl);
             match entry {
                 Some(entry) => {
                     if entry.key != k {
@@ -243,7 +247,7 @@ impl <K, V, H> HashMap<K, V, H>
             );
             for slot in 0..prev_table.capacity {
                 let ptr = prev_table.addr + slot * self.entry_size;
-                let entry = Entry::<K, V>::new_from(ptr);
+                let entry = Entry::<K, V>::new_from(ptr, self.kl, self.vl);
                 match entry {
                     Some(entry) => {
                         match entry.tag {

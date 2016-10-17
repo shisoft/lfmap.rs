@@ -44,7 +44,7 @@ fn resize () {
 
 #[test]
 fn parallel() {
-    let map = Arc::new(lfmap::HashMap::<u64, u64>::new());
+    let map = Arc::new(lfmap::HashMap::<u32, u32>::new());
     let mut threads = vec![];
     for i in 0..9 {
         let map = map.clone();
