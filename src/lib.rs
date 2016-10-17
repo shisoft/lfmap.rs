@@ -30,31 +30,12 @@ impl <H> Default for Options<H> where H: BuildHasher + Default {
     }
 }
 
-enum EntryTag {
-    Empty,
-    LIVE,
-    DEAD,
-    MOVED
-}
-
-fn tag_from_num(tag: u8) -> EntryTag {
-    match tag {
-        0 => EntryTag::Empty,
-        1 => EntryTag::LIVE,
-        2 => EntryTag::DEAD,
-        3 => EntryTag::MOVED,
-        _ => EntryTag::Empty
-    }
-}
-
-fn num_from_tag(tag: &EntryTag) -> u8 {
-    match tag {
-        &EntryTag::Empty   => 0,
-        &EntryTag::LIVE    => 1,
-        &EntryTag::DEAD    => 2,
-        &EntryTag::MOVED   => 3
-    }
-}
+//enum EntryTag {
+//    Empty,
+//    LIVE,
+//    DEAD,
+//    MOVED
+//}
 
 struct Table {
     addr: u64,
@@ -113,7 +94,7 @@ pub struct HashMap<K, V, H = RandomState>
 
 pub struct Entry<K, V> where K: Copy, V: Copy {
     key: K,
-    tag: EntryTag,
+    tag: u8,
 
     vp: PhantomData<V>
 }
@@ -131,7 +112,7 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
             } else {
                 Some(
                     Entry {
-                        tag: tag_from_num(tag),
+                        tag: tag,
                         key: ptr::read(ptr as *mut K),
 
                         vp: PhantomData
@@ -171,28 +152,27 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
         unsafe {
             let mem_ptr = mem_ptr as usize;
             let kl = mem::size_of::<K>();
-            Entry::<K, V>::set_tag(mem_ptr, &self.tag);
+            Entry::<K, V>::set_tag(mem_ptr, self.tag);
             ptr::write(mem_ptr as *mut K, self.key);
             ptr::write((mem_ptr + kl) as *mut V, init);
         }
     }
-    fn set_tag(ptr: usize, tag: &EntryTag) {
+    fn set_tag(ptr: usize, tag: u8) {
         let kl = mem::size_of::<K>();
         let vl = mem::size_of::<V>();
         let tag_ptr = ptr + kl + vl;
         unsafe {
-            intrinsics::atomic_store(tag_ptr as *mut u8, num_from_tag(tag))
+            intrinsics::atomic_store(tag_ptr as *mut u8, tag)
         }
     }
-    fn cas_tag(ptr: usize, old: &EntryTag, new: &EntryTag) -> (EntryTag, bool) {
+    fn cas_tag(ptr: usize, old: u8, new: u8) -> (u8, bool) {
         let kl = mem::size_of::<K>();
         let vl = mem::size_of::<V>();
         let tag_ptr = ptr + kl + vl;
-        let old_byte = num_from_tag(old);
-        let new_byte = num_from_tag(new);
+        let old_byte = old;
+        let new_byte = new;
         unsafe {
-            let (val, ok) = intrinsics::atomic_cxchg_acqrel(tag_ptr as *mut u8, old_byte, new_byte);
-            (tag_from_num(val), ok)
+            intrinsics::atomic_cxchg_acqrel(tag_ptr as *mut u8, old_byte, new_byte)
         }
     }
 }
@@ -267,9 +247,9 @@ impl <K, V, H> HashMap<K, V, H>
                 match entry {
                     Some(entry) => {
                         match entry.tag {
-                            EntryTag::LIVE => {
+                            1 => {
                                 self.insert(entry.key, Entry::<K, V>::load_val(ptr));
-                                Entry::<K, V>::set_tag(ptr as usize, &EntryTag::MOVED);
+                                Entry::<K, V>::set_tag(ptr as usize, 3);
                             }
                             _ => {},
                         }
@@ -288,7 +268,7 @@ impl <K, V, H> HashMap<K, V, H>
     fn put_new_entry(k: K, v: V, ptr: u64) {
         let entry = Entry {
             key: k,
-            tag: EntryTag::LIVE,
+            tag: 1,
 
             vp: PhantomData
         };
@@ -298,7 +278,7 @@ impl <K, V, H> HashMap<K, V, H>
         if self.is_resizing() {
             let (entry, ptr) = self.find(k, &self.prev_table);
             match entry {
-                Some(entry) => Entry::<K, V>::set_tag(ptr as usize, &EntryTag::MOVED),
+                Some(entry) => Entry::<K, V>::set_tag(ptr as usize, 3),
                 None => {}
             }
         }
@@ -312,7 +292,7 @@ impl <K, V, H> HashMap<K, V, H>
         let result = {
             match entry {
                 Some(_) => {
-                    Entry::<K, V>::set_tag(ptr as usize, &EntryTag::LIVE);
+                    Entry::<K, V>::set_tag(ptr as usize, 1);
                     let old = Entry::<K, V>::compare_and_swap_to(ptr, v);
                     return Some(old)
                 },
@@ -333,7 +313,7 @@ impl <K, V, H> HashMap<K, V, H>
         match entry {
             Some(entry) => {
                 match entry.tag {
-                    EntryTag::LIVE => Some(Entry::<K, V>::load_val(ptr)),
+                    1 => Some(Entry::<K, V>::load_val(ptr)),
                     _ => None,
                 }
             },
@@ -351,8 +331,8 @@ impl <K, V, H> HashMap<K, V, H>
                 None => read_current(),
                 Some(prev_entry) => {
                     match prev_entry.tag {
-                        EntryTag::MOVED | EntryTag::Empty => read_current(),
-                        EntryTag::LIVE => {
+                        3 | 0 => read_current(),
+                        1 => {
                             self.get_from_entry_ptr(Some(prev_entry), prev_ptr)
                         }
                         _ => None
@@ -372,13 +352,11 @@ impl <K, V, H> HashMap<K, V, H>
         match entry {
             Some(entry) => {
                 match entry.tag {
-                    EntryTag::LIVE => {
-                        Entry::<K, V>::cas_tag(ptr as usize, &EntryTag::LIVE, &EntryTag::DEAD);
+                    1 => {
+                        Entry::<K, V>::cas_tag(ptr as usize, 1, 3);
                         Some(Entry::<K, V>::load_val(ptr))
                     },
-                    EntryTag::Empty => None,
-                    EntryTag::DEAD => None,
-                    EntryTag::MOVED => None,
+                    _ => None,
                 }
             }
             None => None
