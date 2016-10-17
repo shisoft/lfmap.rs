@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 #[test]
 fn prim_test () {
-    let mut map = lfmap::HashMap::<u32, u32>::new();
+    let map = lfmap::HashMap::<u32, u32>::new();
     map.insert(123, 456);
     map.insert(789, 101112);
     assert_eq!(map.get(123).unwrap(), 456);
@@ -30,7 +30,7 @@ fn prim_test () {
 
 #[test]
 fn resize () {
-    let mut map = lfmap::HashMap::<u32, u32>::new();
+    let map = lfmap::HashMap::<u32, u32>::new();
     for i in 0..2048 {
         map.insert(i, i * 2);
     }
@@ -46,11 +46,11 @@ fn resize () {
 fn parallel() {
     let map = Arc::new(lfmap::HashMap::<u32, u32>::new());
     let mut threads = vec![];
-    for i in 0..9 {
+    for i in 0..4 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 0..40 {
+                for j in 0..50 {
                     map.insert(i + j * 10, i * j);
                 }
 

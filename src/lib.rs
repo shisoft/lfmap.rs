@@ -107,7 +107,7 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
         unsafe {
             let ptr = ptr as u64;
             let tag_ptr = ptr + kl + vl;
-            let tag = intrinsics::atomic_load(tag_ptr as *mut u8);
+            let tag = intrinsics::atomic_load_relaxed(tag_ptr as *mut u8);
             if tag == 0 {
                 None
             } else {
@@ -125,22 +125,21 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
     pub fn compare_and_swap(ptr: u64, old: V, new: V) -> (V, bool) {
         let kl = mem::size_of::<K>() as u64;
         unsafe {
-            intrinsics::atomic_cxchg_acqrel((ptr + kl) as *mut V, old, new)
+            intrinsics::atomic_cxchg_relaxed((ptr + kl) as *mut V, old, new)
         }
     }
     pub fn load_val(ptr: u64) -> V {
         let kl = mem::size_of::<K>() as u64;
         unsafe {
-            intrinsics::atomic_load((ptr + kl) as *mut V)
+            intrinsics::atomic_load_relaxed((ptr + kl) as *mut V)
         }
     }
-    pub fn compare_and_swap_to(ptr: u64, new: V) -> V {
-        let kl = mem::size_of::<K>();
+    pub fn compare_and_swap_to(ptr: u64, new: V, kl: u64) -> V {
         let ptr = ptr + kl as u64;
         unsafe {
-            let mut old = intrinsics::atomic_load(ptr as *mut V);
+            let mut old = intrinsics::atomic_load_relaxed(ptr as *mut V);
             loop {
-                let (val, ok) = intrinsics::atomic_cxchg_acqrel(ptr as *mut V, old, new);
+                let (val, ok) = intrinsics::atomic_cxchg_relaxed(ptr as *mut V, old, new);
                 if ok {
                     return old;
                 } else {
@@ -149,16 +148,7 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
             }
         }
     }
-    fn to(&self, mem_ptr: u64, init: V) {
-        unsafe {
-            let mem_ptr = mem_ptr as usize;
-            let kl = mem::size_of::<K>();
-            Entry::<K, V>::set_tag(mem_ptr, self.tag);
-            ptr::write(mem_ptr as *mut K, self.key);
-            ptr::write((mem_ptr + kl) as *mut V, init);
-        }
-    }
-    fn set_tag(ptr: usize, tag: u8) {
+    fn set_tag(ptr: usize, tag: u8, kl: u64, vl: u64) {
         let kl = mem::size_of::<K>();
         let vl = mem::size_of::<V>();
         let tag_ptr = ptr + kl + vl;
@@ -166,14 +156,12 @@ impl <K, V> Entry<K, V> where K: Copy, V: Copy {
             intrinsics::atomic_store(tag_ptr as *mut u8, tag)
         }
     }
-    fn cas_tag(ptr: usize, old: u8, new: u8) -> (u8, bool) {
-        let kl = mem::size_of::<K>();
-        let vl = mem::size_of::<V>();
+    fn cas_tag(ptr: u64, old: u8, new: u8, kl: u64, vl: u64) -> (u8, bool) {
         let tag_ptr = ptr + kl + vl;
         let old_byte = old;
         let new_byte = new;
         unsafe {
-            intrinsics::atomic_cxchg_acqrel(tag_ptr as *mut u8, old_byte, new_byte)
+            intrinsics::atomic_cxchg_relaxed(tag_ptr as *mut u8, old_byte, new_byte)
         }
     }
 }
@@ -215,14 +203,14 @@ impl <K, V, H> HashMap<K, V, H>
     fn find(&self, k: K, table_ptr: &AtomicU64) -> (Option<Entry<K, V>>, u64) {
         let table = Table::from_raw(table_ptr);
         let hash = self.hash(&k);
-        let mut slot = self.table_slot(&hash, &table);
+        let mut slot = self.table_slot(hash, &table);
         loop {
             let ptr = table.addr + slot * self.entry_size;
             let entry = Entry::<K, V>::new_from(ptr, self.kl, self.vl);
             match entry {
                 Some(entry) => {
                     if entry.key != k {
-                        slot = self.table_slot(&(slot + 1), &table);
+                        slot = self.table_slot(slot + 1, &table);
                     } else {
                         return (Some(entry), ptr)
                     }
@@ -253,7 +241,7 @@ impl <K, V, H> HashMap<K, V, H>
                         match entry.tag {
                             1 => {
                                 self.insert(entry.key, Entry::<K, V>::load_val(ptr));
-                                Entry::<K, V>::set_tag(ptr as usize, 3);
+                                Entry::<K, V>::set_tag(ptr as usize, 3, self.kl, self.vl);
                             }
                             _ => {},
                         }
@@ -269,20 +257,11 @@ impl <K, V, H> HashMap<K, V, H>
             self.resizing.store(false, Ordering::Relaxed);
         }
     }
-    fn put_new_entry(k: K, v: V, ptr: u64) {
-        let entry = Entry {
-            key: k,
-            tag: 1,
-
-            vp: PhantomData
-        };
-        entry.to(ptr, v);
-    }
     fn set_entry_moved(&self, k: K) {
         if self.is_resizing() {
             let (entry, ptr) = self.find(k, &self.prev_table);
             match entry {
-                Some(entry) => Entry::<K, V>::set_tag(ptr as usize, 3),
+                Some(entry) => Entry::<K, V>::set_tag(ptr as usize, 3, self.kl, self.vl),
                 None => {}
             }
         }
@@ -292,17 +271,36 @@ impl <K, V, H> HashMap<K, V, H>
         if curr_table.contained > self.capacity() / 2 {
             self.resize();
         }
-        let (entry, ptr) = self.find(k, &self.curr_table);
-        let result = {
+
+        let table = Table::from_raw(&self.curr_table);
+        let hash = self.hash(&k);
+        let mut slot = self.table_slot(hash, &table);
+        let mut result;
+        loop {
+            let ptr = table.addr + slot * self.entry_size;
+            let entry = Entry::<K, V>::new_from(ptr, self.kl, self.vl);
             match entry {
-                Some(_) => {
-                    Entry::<K, V>::set_tag(ptr as usize, 1);
-                    let old = Entry::<K, V>::compare_and_swap_to(ptr, v);
-                    return Some(old)
+                Some(entry) => {
+                    if entry.key != k {
+                        slot = self.table_slot(slot + 1, &table);
+                    } else {
+                        let old = Entry::<K, V>::compare_and_swap_to(ptr, v, self.kl);
+                        Entry::<K, V>::set_tag(ptr as usize, 1, self.kl, self.vl);
+                        result = Some(old);
+                        break;
+                    }
                 },
                 None => {
-                    HashMap::<K, V>::put_new_entry(k, v, ptr);
-                    None
+                    unsafe {
+                        let (val, ok) = Entry::<K, V>::cas_tag(ptr, 0, 1, self.kl, self.vl);
+                        if !ok {
+                            continue;
+                        }
+                        ptr::write(ptr as *mut K, k);
+                        ptr::write((ptr + self.kl) as *mut V, v);
+                    }
+                    result = None;
+                    break;
                 }
             }
         };
@@ -357,7 +355,7 @@ impl <K, V, H> HashMap<K, V, H>
             Some(entry) => {
                 match entry.tag {
                     1 => {
-                        Entry::<K, V>::cas_tag(ptr as usize, 1, 3);
+                        Entry::<K, V>::cas_tag(ptr, 1, 3, self.kl, self.vl);
                         Some(Entry::<K, V>::load_val(ptr))
                     },
                     _ => None,
@@ -405,10 +403,7 @@ impl <K, V, H> HashMap<K, V, H>
         key.hash(&mut hasher);
         hasher.finish()
     }
-    fn table_slot_from_ptr(&self, hash: &u64, table_ptr: AtomicU64) -> u64 {
-        self.table_slot(hash, &Table::from_raw(&table_ptr))
-    }
-    fn table_slot(&self, hash: &u64, table: &Table) -> u64 {
+    fn table_slot(&self, hash: u64, table: &Table) -> u64 {
         hash & (table.capacity - 1)
     }
     pub fn capacity(&self) -> u64 {
