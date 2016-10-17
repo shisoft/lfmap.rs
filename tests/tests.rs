@@ -44,11 +44,14 @@ fn resize () {
 
 #[test]
 fn parallel() {
-    let map = Arc::new(lfmap::HashMap::<u32, u32>::new());
-    for i in 0..3 {
+    let map = Arc::new(lfmap::HashMap::<u64, u64>::new());
+    for i in 0..9 {
         let map = map.clone();
         thread::spawn(move || {
-            map.get(123);
+            for j in 0..2560 {
+                map.insert(i + j * 10, i * j);
+            }
+
         });
     }
 }

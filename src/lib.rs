@@ -105,6 +105,8 @@ pub struct HashMap<K, V, H = RandomState>
     prev_table: AtomicU64,
     entry_size: u64,
 
+    resizing: AtomicBool,
+
     kp: PhantomData<K>,
     vp: PhantomData<V>,
 }
@@ -217,6 +219,8 @@ impl <K, V, H> HashMap<K, V, H>
             hasher_factory: opts.hasher_factory,
             entry_size: entry_size as u64,
 
+            resizing: AtomicBool::new(false),
+
             kp: PhantomData,
             vp: PhantomData
         }
@@ -244,38 +248,41 @@ impl <K, V, H> HashMap<K, V, H>
         };
     }
     fn resize(&self) {
-        let prev_table = Table::from_raw(&self.curr_table);
-        let new_capacity = prev_table.capacity * 2;
-        let new_addr = new_table(self.entry_size, new_capacity);
-        self.prev_table.store(self.curr_table.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.curr_table.store(
-            Table{
-                addr: new_addr,
-                capacity: new_capacity,
-                contained: 0
-            }.to_raw()
-            , Ordering::Relaxed
-        );
-        for slot in 0..prev_table.capacity {
-            let ptr = prev_table.addr + slot * self.entry_size;
-            let entry = Entry::<K, V>::new_from(ptr);
-            match entry {
-                Some(entry) => {
-                    match entry.tag {
-                        EntryTag::LIVE => {
-                            self.insert(entry.key, Entry::<K, V>::load_val(ptr));
-                            Entry::<K, V>::set_tag(ptr as usize, &EntryTag::MOVED);
+        if !self.resizing.compare_and_swap(false, true, Ordering::Relaxed) {
+            let prev_table = Table::from_raw(&self.curr_table);
+            let new_capacity = prev_table.capacity * 2;
+            let new_addr = new_table(self.entry_size, new_capacity);
+            self.prev_table.store(self.curr_table.load(Ordering::Relaxed), Ordering::Relaxed);
+            self.curr_table.store(
+                Table{
+                    addr: new_addr,
+                    capacity: new_capacity,
+                    contained: 0
+                }.to_raw()
+                , Ordering::Relaxed
+            );
+            for slot in 0..prev_table.capacity {
+                let ptr = prev_table.addr + slot * self.entry_size;
+                let entry = Entry::<K, V>::new_from(ptr);
+                match entry {
+                    Some(entry) => {
+                        match entry.tag {
+                            EntryTag::LIVE => {
+                                self.insert(entry.key, Entry::<K, V>::load_val(ptr));
+                                Entry::<K, V>::set_tag(ptr as usize, &EntryTag::MOVED);
+                            }
+                            _ => {},
                         }
-                        _ => {},
-                    }
-                },
-                None => {}
+                    },
+                    None => {}
+                }
             }
-        }
-        self.prev_table.store(0, Ordering::Relaxed);
-        unsafe {
-            libc::free(prev_table.addr as *mut libc::c_void);
-            libc::free(self.prev_table.load(Ordering::Relaxed) as *mut libc::c_void)
+            self.prev_table.store(0, Ordering::Relaxed);
+            unsafe {
+                libc::free(prev_table.addr as *mut libc::c_void);
+                libc::free(self.prev_table.load(Ordering::Relaxed) as *mut libc::c_void)
+            }
+            self.resizing.store(false, Ordering::Relaxed);
         }
     }
     fn put_new_entry(k: K, v: V, ptr: u64) {
