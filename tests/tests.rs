@@ -55,11 +55,11 @@ fn parallel_no_resize() {
         })
     );
     let mut threads = vec![];
-    for i in 0..4 {
+    for i in 0..9 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 0..50 {
+                for j in 0..60 {
                     map.insert(i + j * 10, i * j);
                 }
 
@@ -69,11 +69,11 @@ fn parallel_no_resize() {
     for thread in threads {
         let _ = thread.join();
     }
-//    for i in 0..9 {
-//        for j in 0..40 {
-//            assert_eq!(map.get(i + j * 10).unwrap(), i * j)
-//        }
-//    }
+    for i in 0..9 {
+        for j in 0..60 {
+            assert_eq!(map.get(i + j * 10).unwrap(), i * j)
+        }
+    }
 }
 
 #[test]
