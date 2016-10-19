@@ -173,10 +173,19 @@ fn new_table(entry_size: u64, capacity: u64) -> u64 {
     }
     addr
 }
+fn is_power_of_2(num: u64) -> bool {
+    if num < 1 {return false}
+    if num <= 2 {return true}
+    if num % 2 == 1 {return false};
+    return is_power_of_2(num / 2);
+}
 impl <K, V, H> HashMap<K, V, H>
     where K: Hash + Eq + Copy + Send, V: Copy + Send, H: BuildHasher + Send
 {
     pub fn with_options(opts: Options<H>) -> HashMap<K, V, H> {
+        if !is_power_of_2(opts.capacity) {
+            panic!("Capacity must be power of 2 but got: {}", opts.capacity);
+        }
         let kl = mem::size_of::<K>();
         let vl = mem::size_of::<V>();
         let tl = mem::size_of::<u8>();
@@ -283,6 +292,7 @@ impl <K, V, H> HashMap<K, V, H>
                 Some(entry) => {
                     if entry.key != k {
                         slot = self.table_slot(slot + 1, &table);
+                        continue;
                     } else {
                         let old = Entry::<K, V>::compare_and_swap_to(ptr, v, self.kl);
                         Entry::<K, V>::set_tag(ptr as usize, 1, self.kl, self.vl);
@@ -294,6 +304,7 @@ impl <K, V, H> HashMap<K, V, H>
                     unsafe {
                         let (val, ok) = Entry::<K, V>::cas_tag(ptr, 0, 1, self.kl, self.vl);
                         if !ok {
+                            slot = self.table_slot(slot + 1, &table);
                             continue;
                         }
                         ptr::write(ptr as *mut K, k);

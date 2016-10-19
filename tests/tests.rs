@@ -30,7 +30,11 @@ fn prim_test () {
 
 #[test]
 fn resize () {
-    let map = lfmap::HashMap::<u32, u32>::new();
+    let map = lfmap::HashMap::<u32, u32>::with_options
+        (lfmap::Options{
+            capacity: 2,
+            hasher_factory: Default::default()
+        });
     for i in 0..2048 {
         map.insert(i, i * 2);
     }
@@ -43,8 +47,13 @@ fn resize () {
 }
 
 #[test]
-fn parallel() {
-    let map = Arc::new(lfmap::HashMap::<u32, u32>::new());
+fn parallel_no_resize() {
+    let map = Arc::new(lfmap::HashMap::<u32, u32>::with_options
+        (lfmap::Options{
+            capacity: 2048,
+            hasher_factory: Default::default()
+        })
+    );
     let mut threads = vec![];
     for i in 0..4 {
         let map = map.clone();
