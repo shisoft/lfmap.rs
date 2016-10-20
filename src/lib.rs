@@ -254,7 +254,7 @@ impl <K, V, H> HashMap<K, V, H>
                     Some(entry) => {
                         match entry.tag {
                             1 => {
-                                self.insert_(&new_table, entry.key, Entry::<K, V>::load_val(ptr));
+                                self.insert_(&new_table, entry.key, Some(Entry::<K, V>::load_val(ptr)), 1);
                                 Entry::<K, V>::set_tag(ptr as usize, 3, self.kl, self.vl);
                             }
                             _ => {},
@@ -291,10 +291,10 @@ impl <K, V, H> HashMap<K, V, H>
             self.resize();
             table = Table::from_raw(&self.curr_table);
         }
-        self.insert_(&table, k, v)
+        self.insert_(&table, k, Some(v), 1)
     }
 
-    fn insert_(&self, table: &Table, k: K, v: V) -> Option<V> {
+    fn insert_(&self, table: &Table, k: K, v: Option<V>, tag: u8) -> Option<V> {
         let hash = self.hash(&k);
         let mut slot = self.table_slot(hash, &table);
         let mut result;
@@ -307,9 +307,16 @@ impl <K, V, H> HashMap<K, V, H>
                         slot = self.table_slot(slot + 1, &table);
                         continue;
                     } else {
-                        let old = Entry::<K, V>::compare_and_swap_to(ptr, v, self.kl);
-                        Entry::<K, V>::set_tag(ptr as usize, 1, self.kl, self.vl);
-                        result = Some(old);
+                        match v {
+                            Some(v) => {
+                                let old = Entry::<K, V>::compare_and_swap_to(ptr, v, self.kl);
+                                result = Some(old);
+                            },
+                            None => {
+                                result = self.get_from_entry_ptr(Some(entry), ptr);
+                            }
+                        }
+                        Entry::<K, V>::set_tag(ptr as usize, tag, self.kl, self.vl);
                         break;
                     }
                 },
@@ -321,7 +328,10 @@ impl <K, V, H> HashMap<K, V, H>
                             continue;
                         }
                         ptr::write(ptr as *mut K, k);
-                        ptr::write((ptr + self.kl) as *mut V, v);
+                        match v {
+                            Some(v) => ptr::write((ptr + self.kl) as *mut V, v),
+                            None => {}
+                        }
                     }
                     result = None;
                     break;
@@ -370,22 +380,15 @@ impl <K, V, H> HashMap<K, V, H>
         }
     }
     pub fn remove(&self, k: K) -> Option<V> {
-        let (entry, ptr) = if self.is_resizing() {
-            self.find(k, &self.prev_table)
+        let curr_t_val = self.insert_(&Table::from_raw(&self.curr_table), k, None, 2);
+        let mut prev_t_val = None;
+        if self.is_resizing() {
+            prev_t_val = self.insert_(&Table::from_raw(&self.prev_table), k, None, 3);
+        }
+        if curr_t_val.is_some() {
+            curr_t_val
         } else {
-            self.find(k, &self.curr_table)
-        };
-        match entry {
-            Some(entry) => {
-                match entry.tag {
-                    1 => {
-                        Entry::<K, V>::cas_tag(ptr, 1, 3, self.kl, self.vl);
-                        Some(Entry::<K, V>::load_val(ptr))
-                    },
-                    _ => None,
-                }
-            }
-            None => None
+            prev_t_val
         }
     }
 //    pub fn compute<U: Fn(K, V) -> V>(&self, k: K, compute_val: U) -> Option<V> {
