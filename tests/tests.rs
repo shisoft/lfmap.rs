@@ -77,6 +77,36 @@ fn parallel_no_resize() {
 }
 
 #[test]
+fn parallel_with_resize() {
+    let map = Arc::new(lfmap::HashMap::<u32, u32>::with_options
+        (lfmap::Options{
+            capacity: 32,
+            hasher_factory: Default::default()
+        })
+    );
+    let mut threads = vec![];
+    for i in 0..9 {
+        let map = map.clone();
+        threads.push(
+            thread::spawn(move || {
+                for j in 0..60 {
+                    map.insert(i + j * 10, i * j);
+                }
+
+            })
+        );
+    }
+    for thread in threads {
+        let _ = thread.join();
+    }
+    for i in 0..9 {
+        for j in 0..60 {
+            assert_eq!(map.get(i + j * 10).unwrap(), i * j)
+        }
+    }
+}
+
+#[test]
 fn atom_test () {
     let some_isize = AtomicIsize::new(5);
 

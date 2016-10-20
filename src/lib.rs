@@ -13,6 +13,7 @@ use std::borrow::Borrow;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicPtr, Ordering};
 use std::thread;
+use core::fmt::Display;
 
 const INITIAL_CAPACITY :u64 = 32;
 
@@ -40,7 +41,7 @@ impl <H> Default for Options<H> where H: BuildHasher + Default {
 struct Table {
     addr: u64,
     capacity: u64,
-    contained: u64,
+    obj_ptr: u64
 }
 impl Table {
     fn to_raw_addr(&self, mptr: usize) {
@@ -48,7 +49,7 @@ impl Table {
             let u64_size = mem::size_of::<u64>();
             ptr::write(mptr as *mut u64, self.addr);
             ptr::write((mptr + u64_size) as *mut u64, self.capacity);
-            ptr::write((mptr + u64_size + u64_size) as *mut u64, self.contained);
+            ptr::write((mptr + u64_size + u64_size) as *mut u64, 0);
         }
     }
     fn to_raw(&self) -> u64 {
@@ -61,20 +62,25 @@ impl Table {
     }
     fn from_raw(ptr: &AtomicU64) -> Table {
         let u64_size = mem::size_of::<u64>();
-        let mptr = ptr.load(Ordering::Relaxed) as usize;
+        let mptr = ptr.load(Ordering::SeqCst) as usize;
         unsafe {
             Table {
                 addr: ptr::read(mptr as *mut u64),
                 capacity: ptr::read((mptr + u64_size) as *mut u64),
-                contained: ptr::read((mptr + u64_size + u64_size) as *mut u64),
+                obj_ptr: mptr as u64
             }
         }
     }
-    fn incr_contained(ptr: &AtomicU64) -> u64 {
+    fn incr_contained(&self) -> u64 {
         unsafe {
             let u64_size = mem::size_of::<u64>() as u64;
-            let ptr = ptr.load(Ordering::Relaxed);
-            intrinsics::atomic_xadd_relaxed((ptr + u64_size * 2) as *mut u64, 1)
+            intrinsics::atomic_xadd((self.obj_ptr + u64_size * 2) as *mut u64, 1)
+        }
+    }
+    fn contained(&self) -> u64 {
+        unsafe {
+            let u64_size = mem::size_of::<u64>() as u64;
+            intrinsics::atomic_load((self.obj_ptr + u64_size * 2) as *mut u64)
         }
     }
 }
@@ -180,7 +186,7 @@ fn is_power_of_2(num: u64) -> bool {
     return is_power_of_2(num / 2);
 }
 impl <K, V, H> HashMap<K, V, H>
-    where K: Hash + Eq + Copy + Send, V: Copy + Send, H: BuildHasher + Send
+    where K: Hash + Eq + Copy + Send + Display, V: Copy + Send, H: BuildHasher + Send
 {
     pub fn with_options(opts: Options<H>) -> HashMap<K, V, H> {
         if !is_power_of_2(opts.capacity) {
@@ -192,7 +198,7 @@ impl <K, V, H> HashMap<K, V, H>
         let entry_size = kl + vl + tl;
         let addr = new_table(entry_size as u64, opts.capacity);
         HashMap {
-            curr_table: AtomicU64::new(Table{addr: addr, capacity: opts.capacity, contained: 0}.to_raw()),
+            curr_table: AtomicU64::new(Table{addr: addr, capacity: opts.capacity, obj_ptr: 0}.to_raw()),
             prev_table: AtomicU64::new(0),
             hasher_factory: opts.hasher_factory,
             entry_size: entry_size as u64,
@@ -228,20 +234,19 @@ impl <K, V, H> HashMap<K, V, H>
             }
         };
     }
-    fn resize(&self) {
-        if !self.resizing.compare_and_swap(false, true, Ordering::Relaxed) {
+    fn resize(&self) -> bool {
+        if !self.resizing.compare_and_swap(false, true, Ordering::SeqCst) {
+            assert_eq!(self.prev_table.load(Ordering::SeqCst), 0);
             let prev_table = Table::from_raw(&self.curr_table);
             let new_capacity = prev_table.capacity * 2;
             let new_addr = new_table(self.entry_size, new_capacity);
-            self.prev_table.store(self.curr_table.load(Ordering::Relaxed), Ordering::Relaxed);
-            self.curr_table.store(
-                Table{
-                    addr: new_addr,
-                    capacity: new_capacity,
-                    contained: 0
-                }.to_raw()
-                , Ordering::Relaxed
-            );
+            self.prev_table.store(self.curr_table.load(Ordering::SeqCst), Ordering::SeqCst);
+            self.curr_table.store(Table{
+                addr: new_addr,
+                capacity: new_capacity,
+                obj_ptr: 0
+            }.to_raw(), Ordering::SeqCst);
+            let new_table = Table::from_raw(&self.curr_table);
             for slot in 0..prev_table.capacity {
                 let ptr = prev_table.addr + slot * self.entry_size;
                 let entry = Entry::<K, V>::new_from(ptr, self.kl, self.vl);
@@ -249,7 +254,7 @@ impl <K, V, H> HashMap<K, V, H>
                     Some(entry) => {
                         match entry.tag {
                             1 => {
-                                self.insert(entry.key, Entry::<K, V>::load_val(ptr));
+                                self.insert_(&new_table, entry.key, Entry::<K, V>::load_val(ptr));
                                 Entry::<K, V>::set_tag(ptr as usize, 3, self.kl, self.vl);
                             }
                             _ => {},
@@ -258,12 +263,15 @@ impl <K, V, H> HashMap<K, V, H>
                     None => {}
                 }
             }
-            self.prev_table.store(0, Ordering::Relaxed);
+            self.prev_table.store(0, Ordering::SeqCst);
             unsafe {
                 libc::free(prev_table.addr as *mut libc::c_void);
-                libc::free(self.prev_table.load(Ordering::Relaxed) as *mut libc::c_void)
+                libc::free(self.prev_table.load(Ordering::SeqCst) as *mut libc::c_void)
             }
-            self.resizing.store(false, Ordering::Relaxed);
+            self.resizing.store(false, Ordering::SeqCst);
+            true
+        } else {
+            false
         }
     }
     fn set_entry_moved(&self, k: K) {
@@ -275,13 +283,18 @@ impl <K, V, H> HashMap<K, V, H>
             }
         }
     }
-    pub fn insert(&self, k: K, v: V) -> Option<V> {
-        let curr_table = Table::from_raw(&self.curr_table);
-        if curr_table.contained > self.capacity() / 2 {
-            self.resize();
-        }
 
-        let table = Table::from_raw(&self.curr_table);
+    pub fn insert(&self, k: K, v: V) -> Option<V> {
+        let mut table = Table::from_raw(&self.curr_table);
+        let prev_ptr = table.obj_ptr;
+        while table.contained() > table.capacity / 2  {
+            self.resize();
+            table = Table::from_raw(&self.curr_table);
+        }
+        self.insert_(&table, k, v)
+    }
+
+    fn insert_(&self, table: &Table, k: K, v: V) -> Option<V> {
         let hash = self.hash(&k);
         let mut slot = self.table_slot(hash, &table);
         let mut result;
@@ -316,7 +329,7 @@ impl <K, V, H> HashMap<K, V, H>
             }
         };
         self.set_entry_moved(k);
-        Table::incr_contained(&self.curr_table);
+        table.incr_contained();
         result
     }
     fn is_resizing(&self) -> bool {
