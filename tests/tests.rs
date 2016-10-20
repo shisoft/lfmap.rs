@@ -107,6 +107,58 @@ fn parallel_with_resize() {
 }
 
 #[test]
+fn parallel_hybird() {
+    let map = Arc::new(lfmap::HashMap::<u32, u32>::with_options
+        (lfmap::Options{
+            capacity: 32,
+            hasher_factory: Default::default()
+        })
+    );
+    for i in 0..128 {
+        map.insert(i, i * 10);
+    }
+    let mut threads = vec![];
+    for i in 256..512 {
+        let map = map.clone();
+        threads.push(
+            thread::spawn(move || {
+                for j in 1..60 {
+                    map.insert(i * 10 + j , 1);
+                }
+
+            })
+        );
+    }
+    for i in 0..8 {
+        let map = map.clone();
+        threads.push(
+            thread::spawn(move || {
+                for j in 0..8 {
+                    map.remove(i * j);
+                }
+            })
+        );
+    }
+    for thread in threads {
+        let _ = thread.join();
+    }
+    for i in 256..512 {
+        for j in 1..60 {
+            assert_eq!(map.get(i * 10 + j).unwrap(), 1)
+        }
+    }
+    for i in 0..8 {
+        for j in 0..8 {
+            match map.get(i * j) {
+                Some(v) => {panic!("--- {}, {}, {} ---", v, i ,j);},
+                None => {}
+            }
+        }
+    }
+}
+
+
+#[test]
 fn atom_test () {
     let some_isize = AtomicIsize::new(5);
 
