@@ -221,6 +221,13 @@ impl <K, V, H> HashMap<K, V, H>
     pub fn new() -> HashMap<K, V> {
         HashMap::with_options(Options::default())
     }
+    fn current(&self) -> &AtomicU64 {
+        while
+            self.is_resizing() &&
+                (self.prev_table.load(Ordering::SeqCst) == 0 ||
+                    self.prev_table.load(Ordering::SeqCst) == self.curr_table.load(Ordering::SeqCst)) {}
+        &self.curr_table
+    }
     fn find(&self, k: K, table_ptr: &AtomicU64) -> (Option<Entry<K, V>>, u64) {
         let table = Table::from_raw(table_ptr);
         match table {
@@ -305,10 +312,10 @@ impl <K, V, H> HashMap<K, V, H>
     }
 
     pub fn insert(&self, k: K, v: V) -> Option<V> {
-        let mut table = Table::from_raw(&self.curr_table).unwrap();
+        let mut table = Table::from_raw(&self.current()).unwrap();
         while table.contained() > table.capacity / 2  {
             self.resize();
-            table = Table::from_raw(&self.curr_table).unwrap();
+            table = Table::from_raw(&self.current()).unwrap();
         }
         self.insert_(&table, k, Some(v), 1)
     }
@@ -362,7 +369,7 @@ impl <K, V, H> HashMap<K, V, H>
         result
     }
     fn is_resizing(&self) -> bool {
-        self.prev_table.load(Ordering::SeqCst) != 0
+        self.resizing.load(Ordering::SeqCst)
     }
     fn get_from_entry_ptr(&self, entry: Option<Entry<K, V>>, ptr: u64) -> Option<V> {
         match entry {
@@ -377,7 +384,7 @@ impl <K, V, H> HashMap<K, V, H>
     }
     pub fn get(&self, k: K) -> Option<V> {
         let read_current = || {
-            let (entry, ptr) = self.find(k, &self.curr_table);
+            let (entry, ptr) = self.find(k, &self.current());
             self.get_from_entry_ptr(entry, ptr)
         };
         if self.is_resizing() {
@@ -399,7 +406,7 @@ impl <K, V, H> HashMap<K, V, H>
         }
     }
     pub fn remove(&self, k: K) -> Option<V> {
-        let curr_t_val = self.insert_(&Table::from_raw(&self.curr_table).unwrap(), k, None, 2);
+        let curr_t_val = self.insert_(&Table::from_raw(&self.current()).unwrap(), k, None, 2);
         let mut prev_t_val = None;
         if self.is_resizing() {
             let prev_table = Table::from_raw(&self.prev_table);
@@ -418,10 +425,10 @@ impl <K, V, H> HashMap<K, V, H>
 //        let (entry, ptr) = if resizing {
 //            self.find(k, &self.prev_table)
 //        } else {
-//            self.find(k, &self.curr_table)
+//            self.find(k, &self.current())
 //        };
 //        let (curr_entry, curr_ptr) = if resizing {
-//            self.find(k, &self.curr_table)
+//            self.find(k, &self.current())
 //        } else {
 //            (entry, ptr)
 //        };
@@ -456,6 +463,6 @@ impl <K, V, H> HashMap<K, V, H>
         hash & (table.capacity - 1)
     }
     pub fn capacity(&self) -> u64 {
-        Table::from_raw(&self.curr_table).unwrap().capacity
+        Table::from_raw(&self.current()).unwrap().capacity
     }
 }

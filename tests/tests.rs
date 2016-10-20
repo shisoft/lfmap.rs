@@ -48,19 +48,33 @@ fn resize () {
 
 #[test]
 fn parallel_no_resize() {
-    let map = Arc::new(lfmap::HashMap::<u32, u32>::with_options
+    let map = Arc::new(lfmap::HashMap::<u64, u64>::with_options
         (lfmap::Options{
-            capacity: 2048,
+            capacity: 65536,
             hasher_factory: Default::default()
         })
     );
     let mut threads = vec![];
-    for i in 0..9 {
+    for i in 0..99 {
+        map.insert(i, i * 10);
+    }
+    for i in 100..900 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 0..60 {
-                    map.insert(i + j * 10, i * j);
+                for j in 2..60 {
+                    map.insert(i * 100 + j, i * j);
+                }
+
+            })
+        );
+    }
+    for i in 1..4 {
+        let map = map.clone();
+        threads.push(
+            thread::spawn(move || {
+                for j in 1..10 {
+                    map.remove(i * j);
                 }
 
             })
@@ -69,9 +83,14 @@ fn parallel_no_resize() {
     for thread in threads {
         let _ = thread.join();
     }
-    for i in 0..9 {
-        for j in 0..60 {
-            assert_eq!(map.get(i + j * 10).unwrap(), i * j)
+    for i in 100..900 {
+        for j in 2..60 {
+            assert_eq!(map.get(i * 100 + j).unwrap(), i * j)
+        }
+    }
+    for i in 1..4 {
+        for j in 1..10 {
+            assert!(map.get(i * j).is_none())
         }
     }
 }
@@ -85,7 +104,7 @@ fn parallel_with_resize() {
         })
     );
     let mut threads = vec![];
-    for i in 0..20 {
+    for i in 0..24 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
@@ -99,7 +118,7 @@ fn parallel_with_resize() {
     for thread in threads {
         let _ = thread.join();
     }
-    for i in 0..9 {
+    for i in 0..24 {
         for j in 0..100 {
             assert_eq!(map.get(i + j * 10).unwrap(), i * j)
         }
