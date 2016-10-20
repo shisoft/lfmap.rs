@@ -85,12 +85,12 @@ fn parallel_with_resize() {
         })
     );
     let mut threads = vec![];
-    for i in 0..9 {
+    for i in 0..20 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 0..60 {
-                    map.insert(i + j * 10, i * j);
+                for j in 0..100 {
+                    map.insert(i + j * 100, i * j);
                 }
 
             })
@@ -100,7 +100,7 @@ fn parallel_with_resize() {
         let _ = thread.join();
     }
     for i in 0..9 {
-        for j in 0..60 {
+        for j in 0..100 {
             assert_eq!(map.get(i + j * 10).unwrap(), i * j)
         }
     }
@@ -123,7 +123,7 @@ fn parallel_hybird() {
         threads.push(
             thread::spawn(move || {
                 for j in 1..60 {
-                    map.insert(i * 10 + j , 1);
+                    map.insert(i * 10 + j , 2);
                 }
 
             })
@@ -144,7 +144,7 @@ fn parallel_hybird() {
     }
     for i in 256..512 {
         for j in 1..60 {
-            assert_eq!(map.get(i * 10 + j).unwrap(), 1)
+            assert_eq!(map.get(i * 10 + j).unwrap(), 2)
         }
     }
     for i in 0..8 {

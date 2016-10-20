@@ -258,20 +258,29 @@ impl <K, V, H> HashMap<K, V, H>
                 obj_ptr: 0
             }.to_raw(), Ordering::SeqCst);
             let new_table = Table::from_raw(&self.curr_table).unwrap();
-            for slot in 0..prev_table.capacity {
-                let ptr = prev_table.addr + slot * self.entry_size;
-                let entry = Entry::<K, V>::new_from(ptr, self.kl, self.vl);
-                match entry {
-                    Some(entry) => {
-                        match entry.tag {
-                            1 => {
-                                self.insert_(&new_table, entry.key, Some(Entry::<K, V>::load_val(ptr)), 1);
-                                Entry::<K, V>::set_tag(ptr as usize, 3, self.kl, self.vl);
+            let mut prev_clear = true;
+            loop {
+                for slot in 0..prev_table.capacity {
+                    let ptr = prev_table.addr + slot * self.entry_size;
+                    let entry = Entry::<K, V>::new_from(ptr, self.kl, self.vl);
+                    match entry {
+                        Some(entry) => {
+                            match entry.tag {
+                                1 => {
+                                    self.insert_(&new_table, entry.key, Some(Entry::<K, V>::load_val(ptr)), 1);
+                                    Entry::<K, V>::set_tag(ptr as usize, 3, self.kl, self.vl);
+                                    prev_clear = false;
+                                }
+                                _ => {},
                             }
-                            _ => {},
-                        }
-                    },
-                    None => {}
+                        },
+                        None => {}
+                    }
+                }
+                if prev_clear {
+                    break;
+                } else {
+                    prev_clear = true;
                 }
             }
             self.prev_table.store(0, Ordering::SeqCst);
@@ -297,7 +306,6 @@ impl <K, V, H> HashMap<K, V, H>
 
     pub fn insert(&self, k: K, v: V) -> Option<V> {
         let mut table = Table::from_raw(&self.curr_table).unwrap();
-        let prev_ptr = table.obj_ptr;
         while table.contained() > table.capacity / 2  {
             self.resize();
             table = Table::from_raw(&self.curr_table).unwrap();
