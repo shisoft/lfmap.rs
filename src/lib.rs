@@ -290,6 +290,11 @@ impl Map {
     }
 
     pub fn insert(&self, k: u64, v: u64) -> Option<KV> {
+        if k == 0 {panic!("key: {} is reserved for internal use", k)}
+        match v {
+            0 | 2 | 3 => panic!("value: {} is reserved for internal use", v),
+            _ => {}
+        }
         let mut table = Table::from_raw(&self.current());
         while table.contained() > table.capacity / 2  {
             self.resize();

@@ -31,10 +31,10 @@ fn prim_test () {
 #[test]
 fn resize () {
     let map = lfmap::Map::with_options(2);
-    for i in 0..2048 {
+    for i in 5..2048 {
         map.insert(i, i * 2);
     }
-    for i in 0..2048 {
+    for i in 5..2048 {
         match map.get(i) {
             Some(r) => assert_eq!(r, i * 2),
             None => panic!("{}, {}", i, map.capacity())
@@ -42,36 +42,25 @@ fn resize () {
     }
 }
 
-//#[test]
+#[test]
 fn parallel_no_resize() {
     let map = Arc::new(lfmap::Map::with_options(65536));
     let mut threads = vec![];
-    for i in 0..99 {
+    for i in 5..99 {
         map.insert(i, i * 10);
     }
     for i in 100..900 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 2..60 {
+                for j in 5..60 {
                     map.insert(i * 100 + j, i * j);
                 }
 
             })
         );
     }
-//    for i in 1..4 {
-//        let map = map.clone();
-//        threads.push(
-//            thread::spawn(move || {
-//                for j in 1..10 {
-//                    map.remove(i * j);
-//                }
-//
-//            })
-//        );
-//    }
-    for i in 1..4 {
+    for i in 5..9 {
         for j in 1..10 {
             map.remove(i * j);
         }
@@ -80,26 +69,26 @@ fn parallel_no_resize() {
         let _ = thread.join();
     }
     for i in 100..900 {
-        for j in 2..60 {
+        for j in 5..60 {
             assert_eq!(map.get(i * 100 + j).unwrap(), i * j)
         }
     }
-    for i in 1..4 {
+    for i in 5..9 {
         for j in 1..10 {
             assert!(map.get(i * j).is_none())
         }
     }
 }
 
-//#[test]
+#[test]
 fn parallel_with_resize() {
     let map = Arc::new(lfmap::Map::with_options(32));
     let mut threads = vec![];
-    for i in 0..24 {
+    for i in 5..24 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 0..100 {
+                for j in 5..1000 {
                     map.insert(i + j * 100, i * j);
                 }
 
@@ -109,9 +98,15 @@ fn parallel_with_resize() {
     for thread in threads {
         let _ = thread.join();
     }
-    for i in 0..24 {
-        for j in 0..100 {
-            assert_eq!(map.get(i + j * 10).unwrap(), i * j)
+    for i in 5..24 {
+        for j in 5..1000 {
+            let k = i + j * 100;
+            match map.get(k) {
+                Some(v) => assert_eq!(v, i * j),
+                None => {
+                    panic!("Value should not be None for key: {}", k)
+                }
+            }
         }
     }
 }
@@ -195,77 +190,77 @@ fn atom_ptr_test () {
     }
 }
 
-mod compound_atomic { // failed experiment
-
-    use std::mem;
-    use core::intrinsics;
-    use libc;
-
-    #[test]
-    #[should_panic]
-    fn tuple () {
-        unsafe {
-            let example = (1 as u8, 2 as u16);
-            assert_eq!(mem::size_of_val(&example), mem::size_of::<u8>() + mem::size_of::<u16>());
-        }
-    }
-
-    pub struct ExpStruc<V> {
-        stat: u8,
-        val: V
-    }
-
-    #[test]
-    fn struc () {
-        assert_eq!(mem::size_of::<ExpStruc<u64>>(), mem::size_of::<u64>() * 2);
-        assert_eq!(mem::size_of::<ExpStruc<u32>>(), mem::size_of::<u32>() * 2);
-        assert_eq!(mem::size_of::<ExpStruc<u16>>(), mem::size_of::<u16>() * 2);
-        assert_eq!(mem::size_of::<ExpStruc<u8>>(), mem::size_of::<u8>() * 2);
-    }
-
-    pub enum Value<V> {
-        Empty,
-        Tombstone,
-        Moved,
-        Val(V),
-    }
-
-    #[test]
-    fn enums () {
-        assert_eq!(mem::size_of::<Value<u8>>(), mem::size_of:: <u8>() * 2);
-        assert_eq!(mem::size_of::<Value<u16>>(), mem::size_of::<u16>() * 2);
-        assert_eq!(mem::size_of::<Value<u32>>(), mem::size_of::<u32>() * 2);
-        assert_eq!(mem::size_of::<Value<u64>>(), mem::size_of::<u64>() * 2);
-    }
-
-    pub enum Value2 {
-        Tombstone,
-        Moved
-    }
-
-    #[test]
-    fn enums2 () {
-        assert_eq!(mem::size_of::<Value2>(), 1)
-    }
-
-    pub enum Value3<V> {
-        Tombstone(V),
-        Moved(V),
-        Val(V)
-    }
-
-    #[test]
-    fn enums3 () {
-        assert_eq!(mem::size_of::<Value3<u64>>(), mem::size_of::<u64>() * 2)
-    }
-
+//mod compound_atomic { // failed experiment
+//
+//    use std::mem;
+//    use core::intrinsics;
+//    use libc;
+//
 //    #[test]
-//    fn atomic () {
-//        let size = mem::size_of::<Value<u32>>();
-//        let data = Value::Val(56);
+//    #[should_panic]
+//    fn tuple () {
 //        unsafe {
-//            let ptr = libc::malloc(size);
-//            let should_empty = intrinsics::atomic_load_relaxed(ptr as *mut f32);
+//            let example = (1 as u8, 2 as u16);
+//            assert_eq!(mem::size_of_val(&example), mem::size_of::<u8>() + mem::size_of::<u16>());
 //        }
 //    }
-}
+//
+//    pub struct ExpStruc<V> {
+//        stat: u8,
+//        val: V
+//    }
+//
+//    #[test]
+//    fn struc () {
+//        assert_eq!(mem::size_of::<ExpStruc<u64>>(), mem::size_of::<u64>() * 2);
+//        assert_eq!(mem::size_of::<ExpStruc<u32>>(), mem::size_of::<u32>() * 2);
+//        assert_eq!(mem::size_of::<ExpStruc<u16>>(), mem::size_of::<u16>() * 2);
+//        assert_eq!(mem::size_of::<ExpStruc<u8>>(), mem::size_of::<u8>() * 2);
+//    }
+//
+//    pub enum Value<V> {
+//        Empty,
+//        Tombstone,
+//        Moved,
+//        Val(V),
+//    }
+//
+//    #[test]
+//    fn enums () {
+//        assert_eq!(mem::size_of::<Value<u8>>(), mem::size_of:: <u8>() * 2);
+//        assert_eq!(mem::size_of::<Value<u16>>(), mem::size_of::<u16>() * 2);
+//        assert_eq!(mem::size_of::<Value<u32>>(), mem::size_of::<u32>() * 2);
+//        assert_eq!(mem::size_of::<Value<u64>>(), mem::size_of::<u64>() * 2);
+//    }
+//
+//    pub enum Value2 {
+//        Tombstone,
+//        Moved
+//    }
+//
+//    #[test]
+//    fn enums2 () {
+//        assert_eq!(mem::size_of::<Value2>(), 1)
+//    }
+//
+//    pub enum Value3<V> {
+//        Tombstone(V),
+//        Moved(V),
+//        Val(V)
+//    }
+//
+//    #[test]
+//    fn enums3 () {
+//        assert_eq!(mem::size_of::<Value3<u64>>(), mem::size_of::<u64>() * 2)
+//    }
+//
+////    #[test]
+////    fn atomic () {
+////        let size = mem::size_of::<Value<u32>>();
+////        let data = Value::Val(56);
+////        unsafe {
+////            let ptr = libc::malloc(size);
+////            let should_empty = intrinsics::atomic_load_relaxed(ptr as *mut f32);
+////        }
+////    }
+//}
