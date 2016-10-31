@@ -248,7 +248,7 @@ impl Map {
                         Some(entry) => {
                             match entry.tag {
                                 1 => {
-                                    self.insert_to_table(&new_table, entry.key, Some(Entry::load_val(ptr)));
+                                    self.insert_to_table(&new_table, entry.key, None, Some(Entry::load_val(ptr)));
                                     Entry::set_val(ptr, 3);
                                     prev_clear = false;
                                 }
@@ -297,13 +297,12 @@ impl Map {
             self.resize();
             table = Table::from_raw(&self.current());
         }
-        self.insert_to_table(&table, k, Some(v))
+        self.insert_to_table(&table, k, None, Some(v))
     }
-
-    fn insert_to_table(&self, table: &Table, k: KV, v: Option<KV>) -> Option<KV> {
+    fn insert_to_table(&self, table: &Table, k: KV, expected: Option<KV>, v: Option<KV>) -> Option<KV> {
         let hash = k;
         let mut slot = self.table_slot(hash, &table);
-        let result;
+        let mut result = None;
         loop {
             let ptr = table.body_addr + slot * self.entry_size;
             let entry = Entry::new_from(ptr);
@@ -315,7 +314,15 @@ impl Map {
                     } else {
                         match v {
                             Some(v) => {
-                                result = Some(Entry::cas_val_to(ptr, v));
+                                match expected {
+                                    None => {
+                                        result = Some(Entry::cas_val_to(ptr, v));
+                                    }
+                                    Some(exp_v) => {
+                                        let (pv, _) = Entry::cas_val(ptr, exp_v, v);
+                                        result = Some(pv);
+                                    }
+                                }
                             },
                             None => {
                                 result = Some(entry.val);
@@ -325,29 +332,100 @@ impl Map {
                     }
                 },
                 None => {
-                    let (_, ok) = Entry::cas_key(ptr, 0, k);
-                    if !ok {
-                        slot = self.table_slot(slot + 1, &table);
-                        continue;
+                    match expected {
+                        None | Some(0) => {
+                            let (_, ok) = Entry::cas_key(ptr, 0, k);
+                            if !ok {
+                                slot = self.table_slot(slot + 1, &table);
+                                continue;
+                            }
+                            match v {
+                                Some(v) => {
+                                    match expected {
+                                        None => {
+                                            Entry::set_val(ptr, v);
+                                        },
+                                        Some(0) => {
+                                            let (prev, _) = Entry::cas_val(ptr, 0, v);
+                                            result = Some(prev);
+                                        }
+                                        _ => {}
+                                    }
+                                },
+                                None => {}
+                            }
+                            table.incr_contained();
+                            break;
+                        },
+                        Some(_) => {return None;}
                     }
-                    match v {
-                        Some(v) => Entry::set_val(ptr, v),
-                        None => {}
-                    }
-                    result = None;
-                    break;
                 }
             }
         };
         self.set_entry_moved(k);
-        table.incr_contained();
         result
     }
-    fn get_from_entry_ptr(&self, entry: Option<Entry>, ptr: u64) -> Option<KV> {
+    pub fn update_if(&self, k: KV, expected: KV, v: KV) -> Option<KV> {
+        let update_current = |expected| {
+            self.insert_to_table(&Table::from_raw(&self.curr_table), k, Some(expected), Some(v))
+        };
+        if_resizing!(self, {
+            let (prev_entry, _) = self.find(k, &self.prev_table);
+            match prev_entry {
+                None => update_current(expected),
+                Some(prev_entry) => {
+                    match prev_entry.tag {
+                        1 => {
+                            let prev_val = prev_entry.val;
+                            let mut curr_tb_prev = None;
+                            if prev_val == expected {
+                                curr_tb_prev = update_current(0);
+                            }
+                            match curr_tb_prev {
+                                None | Some(0) => Some(prev_val),
+                                Some(pv) => Some(pv)
+                            }
+                        }
+                        _ => update_current(expected),
+                    }
+                }
+            }
+        }, {
+            update_current(expected)
+        })
+    }
+    pub fn compute<U: Fn(KV, KV) -> KV>(&self, k: KV, compute_val: U) -> Option<KV> {
+        let mut val_opt = self.get(k);
+        loop {
+            match val_opt {
+                Some(val) => {
+                    let computed = compute_val(k, val);
+                    let update_res = self.update_if(k, val, computed);
+                    match update_res {
+                        Some(update_res) => {
+                            if update_res == val {
+                                return Some(computed);
+                            } else {
+                                val_opt = Some(update_res);
+                                continue;
+                            }
+                        },
+                        None => {
+                            return None;
+                        }
+                    }
+                },
+                None => {
+                    return None;
+                }
+            }
+        }
+    }
+    fn get_from_entry_ptr(&self, entry: Option<Entry>) -> Option<KV> {
         match entry {
             Some(entry) => {
                 match entry.tag {
-                    1 => Some(Entry::load_val(ptr)),
+                    1 => Some(entry.val),
                     _ => None,
                 }
             },
@@ -356,18 +434,18 @@ impl Map {
     }
     pub fn get(&self, k: KV) -> Option<KV> {
         let read_current = || {
-            let (entry, ptr) = self.find(k, &self.current());
-            self.get_from_entry_ptr(entry, ptr)
+            let (entry, _) = self.find(k, &self.current());
+            self.get_from_entry_ptr(entry)
         };
         if_resizing!(self, {
-            let (prev_entry, prev_ptr) = self.find(k, &self.prev_table);
+            let (prev_entry, _) = self.find(k, &self.prev_table);
             match prev_entry {
                 None => read_current(),
                 Some(prev_entry) => {
                     match prev_entry.tag {
                         3 | 0 => read_current(),
                         1 => {
-                            self.get_from_entry_ptr(Some(prev_entry), prev_ptr)
+                            self.get_from_entry_ptr(Some(prev_entry))
                         }
                         _ => None
                     }
@@ -378,11 +456,11 @@ impl Map {
         })
     }
     pub fn remove(&self, k: KV) -> Option<KV> {
-        let curr_t_val = self.insert_to_table(&Table::from_raw(&self.current()), k, Some(2));
+        let curr_t_val = self.insert_to_table(&Table::from_raw(&self.current()), k, None, Some(2));
         let mut prev_t_val = None;
         if_resizing!(self, {
             let prev_table = Table::from_raw(&self.prev_table);
-            prev_t_val = self.insert_to_table(&prev_table, k, Some(3));
+            prev_t_val = self.insert_to_table(&prev_table, k, None, Some(3));
         }, {});
         if curr_t_val.is_some() {
             curr_t_val

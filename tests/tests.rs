@@ -22,10 +22,10 @@ fn prim_test () {
     assert_eq!(map.get(123).unwrap(), 123);
     assert_eq!(map.remove(123).unwrap(), 123);
     assert!(map.get(123).is_none());
-//    assert_eq!(map.compute(789, |_, v|{
-//        v - 1000
-//    }).unwrap(), 100112);
-//    assert_eq!(map.get(789).unwrap(), 100112);
+    assert_eq!(map.compute(789, |_, v|{
+        v - 1000
+    }).unwrap(), 100112);
+    assert_eq!(map.get(789).unwrap(), 100112);
 }
 
 #[test]
