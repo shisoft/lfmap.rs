@@ -418,6 +418,21 @@ impl Map {
         Table::from_raw(&self.current()).capacity
     }
 }
+impl Drop for Map {
+    fn drop(&mut self) {
+        let curr_table = Table::from_raw(&self.curr_table);
+        let have_prev_table = self.prev_table.load(Ordering::SeqCst) != 0;
+        unsafe {
+            if have_prev_table {
+                let prev_table = Table::from_raw(&self.prev_table);
+                libc::free(prev_table.body_addr as *mut libc::c_void);
+                libc::free(prev_table.meta_addr as *mut libc::c_void);
+            }
+            libc::free(curr_table.body_addr as *mut libc::c_void);
+            libc::free(curr_table.meta_addr as *mut libc::c_void);
+        }
+    }
+}
 
 struct HashMap<K, V, H> {
     hasher_factory: H,
