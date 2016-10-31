@@ -126,18 +126,18 @@ mod tests {
             map.insert(i, i * 10);
         }
         let mut threads = vec![];
-        for i in 256..512 {
+        for i in 256..265 {
             let map = map.clone();
             threads.push(
                 thread::spawn(move || {
-                    for j in 0..60 {
+                    for j in 5..60 {
                         map.insert(i * 10 + j , 10);
                     }
 
                 })
             );
         }
-        for i in 5..50 {
+        for i in 5..8 {
             let map = map.clone();
             threads.push(
                 thread::spawn(move || {
@@ -150,7 +150,7 @@ mod tests {
         for thread in threads {
             let _ = thread.join();
         }
-        for i in 256..512 {
+        for i in 256..265 {
             for j in 5..60 {
                 assert_eq!(map.get(i * 10 + j).unwrap(), 10)
             }
@@ -158,7 +158,9 @@ mod tests {
         for i in 5..8 {
             for j in 5..8 {
                 match map.get(i * j) {
-                    Some(v) => {panic!("--- {}, {}, {} ---", v, i ,j);},
+                    Some(v) => {
+                        panic!("--- {}, {}, {} ---", v, i ,j);
+                    },
                     None => {}
                 }
             }
@@ -167,7 +169,7 @@ mod tests {
 
     #[test]
     fn parallel_hybird_pressure () {
-        for i in 0..10000 {
+        for i in 0..1000 {
             parallel_hybird();
         }
     }
