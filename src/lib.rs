@@ -382,7 +382,7 @@ impl Map {
                                 curr_tb_prev = update_current(0);
                             }
                             match curr_tb_prev {
-                                None => Some(prev_val),
+                                None | Some(0) => Some(prev_val),
                                 Some(pv) => Some(pv)
                             }
                         }
@@ -394,7 +394,33 @@ impl Map {
             update_current(expected)
         })
     }
-
+    pub fn compute<U: Fn(KV, KV) -> KV>(&self, k: KV, compute_val: U) -> Option<KV> {
+        let mut val_opt = self.get(k);
+        loop {
+            match val_opt {
+                Some(val) => {
+                    let computed = compute_val(k, val);
+                    let update_res = self.update_if(k, val, computed);
+                    match update_res {
+                        Some(update_res) => {
+                            if update_res == val {
+                                return Some(computed);
+                            } else {
+                                val_opt = Some(update_res);
+                                continue;
+                            }
+                        },
+                        None => {
+                            return None;
+                        }
+                    }
+                },
+                None => {
+                    return None;
+                }
+            }
+        }
+    }
     fn get_from_entry_ptr(&self, entry: Option<Entry>) -> Option<KV> {
         match entry {
             Some(entry) => {
