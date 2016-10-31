@@ -10,13 +10,41 @@ use std::mem;
 use std::collections::hash_map::RandomState;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicPtr, Ordering};
-use std::thread;
+use std::{thread, time};
 use core::fmt::Display;
 
 const INITIAL_CAPACITY :u64 = 32;
 type KV = u64;
 const KV_BYTES: usize = (64 / 8);
 const KV_BYTES_U64: u64 = KV_BYTES as u64;
+
+
+macro_rules! if_resizing {
+    (
+        $map: ident, $if_exp: expr, $else_exp: expr
+    ) => (
+        {
+            let mut response;
+            loop {
+                let resizing_counter = $map.resizing.load(Ordering::SeqCst);
+                if $map.prev_table.load(Ordering::SeqCst) != 0 && resizing_counter != 0 {
+                    let prev_count = $map.resizing.compare_and_swap(resizing_counter, resizing_counter + 1, Ordering::SeqCst);
+                    if prev_count != resizing_counter {
+                        continue;
+                    } else {
+                        response = $if_exp;
+                        $map.resizing.fetch_sub(1, Ordering::SeqCst);
+                        break;
+                    }
+                } else {
+                    response = $else_exp;
+                    break;
+                }
+            }
+            response
+        }
+    );
+ }
 
 pub struct Options<H> {
     pub capacity: u64,
@@ -47,17 +75,12 @@ struct Table {
 
 }
 impl Table {
-    fn to_raw_addr(&self, mptr: usize) {
-        unsafe {
-            ptr::write(mptr as *mut KV, self.body_addr);
-            ptr::write((mptr + KV_BYTES) as *mut KV, self.capacity);
-            ptr::write((mptr + KV_BYTES * 2) as *mut KV, self.contained);
-        }
-    }
     fn to_raw(&self) -> u64 {
         unsafe {
             let mptr = libc::malloc(3 * KV_BYTES) as usize;
-            self.to_raw_addr(mptr);
+            ptr::write(mptr as *mut KV, self.body_addr);
+            ptr::write((mptr + KV_BYTES) as *mut KV, self.capacity);
+            ptr::write((mptr + KV_BYTES * 2) as *mut KV, self.contained);
             mptr as u64
         }
     }
@@ -79,7 +102,6 @@ impl Table {
     }
     fn contained(&self) -> u64 {
         unsafe {
-            let u64_size = mem::size_of::<u64>() as u64;
             intrinsics::atomic_load((self.meta_addr + KV_BYTES_U64 * 2) as *mut KV)
         }
     }
@@ -157,7 +179,7 @@ pub struct Map {
     prev_table: AtomicU64,
     entry_size: u64,
 
-    resizing: AtomicBool,
+    resizing: AtomicU64,
 }
 
 fn new_table_body(entry_size: u64, capacity: u64) -> u64 {
@@ -175,7 +197,6 @@ fn is_power_of_2(num: u64) -> bool {
     return is_power_of_2(num / 2);
 }
 impl Map {
-
     pub fn with_options(capacity: u64) -> Map {
         if !is_power_of_2(capacity) {
             panic!("Capacity must be power of 2 but got: {}", capacity);
@@ -193,20 +214,13 @@ impl Map {
             ),
             prev_table: AtomicU64::new(0),
             entry_size: entry_size as u64,
-            resizing: AtomicBool::new(false),
+            resizing: AtomicU64::new(0),
         }
     }
     pub fn new() -> Map {
         Map::with_options(INITIAL_CAPACITY)
     }
-    fn wait_state(&self){
-        while
-            self.resizing.load(Ordering::SeqCst) &&
-                (self.prev_table.load(Ordering::SeqCst) == 0 ||
-                    self.prev_table.load(Ordering::SeqCst) == self.curr_table.load(Ordering::SeqCst)) {}
-    }
     fn current(&self) -> &AtomicU64 {
-        self.wait_state();
         &self.curr_table
     }
     fn find(&self, k: u64, table_ptr: &AtomicU64) -> (Option<Entry>, KV) {
@@ -229,7 +243,7 @@ impl Map {
         };
     }
     fn resize(&self) -> bool {
-        if !self.resizing.compare_and_swap(false, true, Ordering::SeqCst) {
+        if self.resizing.compare_and_swap(0, 1, Ordering::SeqCst) == 0 {
             assert_eq!(self.prev_table.load(Ordering::SeqCst), 0);
             let prev_table = Table::from_raw(&self.curr_table);
             let new_capacity = prev_table.capacity * 2;
@@ -252,7 +266,7 @@ impl Map {
                         Some(entry) => {
                             match entry.tag {
                                 1 => {
-                                    self.insert_(&new_table, entry.key, Some(Entry::load_val(ptr)));
+                                    self.insert_to_table(&new_table, entry.key, Some(Entry::load_val(ptr)));
                                     Entry::set_val(ptr, 3);
                                     prev_clear = false;
                                 }
@@ -268,25 +282,26 @@ impl Map {
                     prev_clear = true;
                 }
             }
+            while self.resizing.compare_and_swap(1, 0, Ordering::SeqCst) != 1 {}
             self.prev_table.store(0, Ordering::SeqCst);
-            self.resizing.store(false, Ordering::SeqCst);
             unsafe {
                 libc::free(prev_table.body_addr as *mut libc::c_void);
                 libc::free(prev_table.meta_addr as *mut libc::c_void);
             }
             true
         } else {
+            thread::sleep(time::Duration::from_millis(10));
             false
         }
     }
     fn set_entry_moved(&self, k: KV) {
-        if self.is_resizing() {
+        if_resizing!(self, {
             let (entry, ptr) = self.find(k, &self.prev_table);
             match entry {
                 Some(entry) => Entry::set_val(ptr, 3),
                 None => {}
             }
-        }
+        }, {});
     }
 
     pub fn insert(&self, k: u64, v: u64) -> Option<KV> {
@@ -300,13 +315,13 @@ impl Map {
             self.resize();
             table = Table::from_raw(&self.current());
         }
-        self.insert_(&table, k, Some(v))
+        self.insert_to_table(&table, k, Some(v))
     }
 
-    fn insert_(&self, table: &Table, k: KV, v: Option<KV>) -> Option<KV> {
+    fn insert_to_table(&self, table: &Table, k: KV, v: Option<KV>) -> Option<KV> {
         let hash = k;
         let mut slot = self.table_slot(hash, &table);
-        let mut result;
+        let result;
         loop {
             let ptr = table.body_addr + slot * self.entry_size;
             let entry = Entry::new_from(ptr);
@@ -348,10 +363,6 @@ impl Map {
         table.incr_contained();
         result
     }
-    fn is_resizing(&self) -> bool {
-        self.wait_state();
-        self.resizing.load(Ordering::SeqCst)
-    }
     fn get_from_entry_ptr(&self, entry: Option<Entry>, ptr: u64) -> Option<KV> {
         match entry {
             Some(entry) => {
@@ -368,7 +379,7 @@ impl Map {
             let (entry, ptr) = self.find(k, &self.current());
             self.get_from_entry_ptr(entry, ptr)
         };
-        if self.is_resizing() {
+        if_resizing!(self, {
             let (prev_entry, prev_ptr) = self.find(k, &self.prev_table);
             match prev_entry {
                 None => read_current(),
@@ -382,17 +393,17 @@ impl Map {
                     }
                 }
             }
-        } else {
+        }, {
             read_current()
-        }
+        })
     }
     pub fn remove(&self, k: KV) -> Option<KV> {
-        let curr_t_val = self.insert_(&Table::from_raw(&self.current()), k, Some(2));
+        let curr_t_val = self.insert_to_table(&Table::from_raw(&self.current()), k, Some(2));
         let mut prev_t_val = None;
-        if self.is_resizing() {
+        if_resizing!(self, {
             let prev_table = Table::from_raw(&self.prev_table);
-            prev_t_val = self.insert_(&prev_table, k, Some(3));
-        }
+            prev_t_val = self.insert_to_table(&prev_table, k, Some(3));
+        }, {});
         if curr_t_val.is_some() {
             curr_t_val
         } else {
