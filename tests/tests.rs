@@ -111,10 +111,10 @@ fn parallel_with_resize() {
     }
 }
 
-//#[test]
+#[test]
 fn parallel_hybird() {
     let map = Arc::new(lfmap::Map::with_options(32));
-    for i in 0..128 {
+    for i in 5..128 {
         map.insert(i, i * 10);
     }
     let mut threads = vec![];
@@ -122,18 +122,18 @@ fn parallel_hybird() {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 1..60 {
-                    map.insert(i * 10 + j , 2);
+                for j in 0..60 {
+                    map.insert(i * 10 + j , 10);
                 }
 
             })
         );
-    } 
-    for i in 0..8 {
+    }
+    for i in 5..50 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
-                for j in 0..8 {
+                for j in 5..8 {
                     map.remove(i * j);
                 }
             })
@@ -143,12 +143,12 @@ fn parallel_hybird() {
         let _ = thread.join();
     }
     for i in 256..512 {
-        for j in 1..60 {
-            assert_eq!(map.get(i * 10 + j).unwrap(), 2)
+        for j in 5..60 {
+            assert_eq!(map.get(i * 10 + j).unwrap(), 10)
         }
     }
-    for i in 0..8 {
-        for j in 0..8 {
+    for i in 5..8 {
+        for j in 5..8 {
             match map.get(i * j) {
                 Some(v) => {panic!("--- {}, {}, {} ---", v, i ,j);},
                 None => {}

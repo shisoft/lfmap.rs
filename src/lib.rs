@@ -290,7 +290,7 @@ impl Map {
             }
             true
         } else {
-            thread::sleep(time::Duration::from_millis(10));
+            thread::sleep(time::Duration::from_millis(1)); //weird, but essential
             false
         }
     }
