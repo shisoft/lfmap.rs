@@ -12,6 +12,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicPtr, Ordering};
 use std::{thread, time};
 use core::fmt::Display;
+use std::marker::{PhantomData, Copy};
 
 const INITIAL_CAPACITY :u64 = 32;
 type KV = u64;
@@ -410,39 +411,6 @@ impl Map {
             prev_t_val
         }
     }
-//    pub fn compute<U: Fn(K, V) -> V>(&self, k: K, compute_val: U) -> Option<V> {
-//        let resizing = self.is_resizing();
-//        let (entry, ptr) = if resizing {
-//            self.find(k, &self.prev_table)
-//        } else {
-//            self.find(k, &self.current())
-//        };
-//        let (curr_entry, curr_ptr) = if resizing {
-//            self.find(k, &self.current())
-//        } else {
-//            (entry, ptr)
-//        };
-//        match entry {
-//            Some(entry) => {
-//                match entry.tag {
-//                    EntryTag::LIVE => {
-//                        let old = Entry::<K, V>::load_val(ptr);
-//                        loop {
-//                            let new = compute_val(k, old);
-//                            let (_, ok) = Entry::<K, V>::compare_and_swap(ptr, old, new);
-//                            if ok {
-//                                return Some(new)
-//                            }
-//                        }
-//                    },
-//                    EntryTag::Empty => None,
-//                    EntryTag::DEAD => None,
-//                    EntryTag::MOVED => None,
-//                }
-//            }
-//            None => None
-//        }
-//    }
     fn table_slot(&self, hash: u64, table: &Table) -> u64 {
         hash & (table.capacity - 1)
     }
@@ -450,3 +418,10 @@ impl Map {
         Table::from_raw(&self.current()).capacity
     }
 }
+
+struct HashMap<K, V, H> {
+    hasher_factory: H,
+    kp: PhantomData<K>,
+    vp: PhantomData<V>,
+}
+
