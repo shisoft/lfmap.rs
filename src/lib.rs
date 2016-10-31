@@ -363,7 +363,11 @@ impl Map {
             }
         };
         self.set_entry_moved(k);
-        result
+        match result {
+            None => None,
+            Some(0) | Some(1) | Some(2) | Some(3) => None,
+            _ => result,
+        }
     }
     pub fn update_if(&self, k: KV, expected: KV, v: KV) -> Option<KV> {
         let update_current = |expected| {
