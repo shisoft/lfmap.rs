@@ -165,6 +165,13 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parallel_hybird_pressure () {
+        for i in 0..10000 {
+            parallel_hybird();
+        }
+    }
+
 
     #[test]
     fn atom_test () {
@@ -196,54 +203,6 @@ mod tests {
 
             assert_eq!(intrinsics::atomic_load_relaxed(ptr as *mut isize), 10);
         }
-    }
-
-    #[bench]
-    fn bench_lfmap(b: &mut Bencher) {
-        b.iter(|| {
-            let map = Arc::new(lfmap::Map::with_options(32));
-            for i in 5..128 {
-                map.insert(i, i * 10);
-            }
-            let mut threads = vec![];
-            for i in 256..512 {
-                let map = map.clone();
-                threads.push(
-                    thread::spawn(move || {
-                        for j in 0..60 {
-                            map.insert(i * 10 + j , 10);
-                        }
-
-                    })
-                );
-            }
-            for i in 5..50 {
-                let map = map.clone();
-                threads.push(
-                    thread::spawn(move || {
-                        for j in 5..8 {
-                            map.remove(i * j);
-                        }
-                    })
-                );
-            }
-            for thread in threads {
-                let _ = thread.join();
-            }
-            for i in 256..512 {
-                for j in 5..60 {
-                    assert_eq!(map.get(i * 10 + j).unwrap(), 10)
-                }
-            }
-            for i in 5..8 {
-                for j in 5..8 {
-                    match map.get(i * j) {
-                        Some(v) => {panic!("--- {}, {}, {} ---", v, i ,j);},
-                        None => {}
-                    }
-                }
-            }
-        });
     }
 
     //mod compound_atomic { // failed experiment
