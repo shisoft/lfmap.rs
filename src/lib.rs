@@ -4,15 +4,10 @@
 extern crate libc;
 extern crate core;
 
-use std::hash::{BuildHasher, Hasher, Hash};
 use core::intrinsics;
-use std::mem;
-use std::collections::hash_map::RandomState;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{thread, time};
-use core::fmt::Display;
-use std::marker::{PhantomData, Copy};
 
 const INITIAL_CAPACITY :u64 = 32;
 type KV = u64;
@@ -25,7 +20,7 @@ macro_rules! if_resizing {
         $map: ident, $if_exp: expr, $else_exp: expr
     ) => (
         {
-            let mut response;
+            let response;
             loop {
                 let resizing_counter = $map.resizing.load(Ordering::SeqCst);
                 if $map.prev_table.load(Ordering::SeqCst) != 0 && resizing_counter != 0 {
@@ -46,20 +41,6 @@ macro_rules! if_resizing {
         }
     );
  }
-
-pub struct Options<H> {
-    pub capacity: u64,
-    pub hasher_factory: H
-}
-
-impl <H> Default for Options<H> where H: BuildHasher + Default {
-    fn default() -> Options<H> {
-        Options {
-            capacity: INITIAL_CAPACITY,
-            hasher_factory: Default::default()
-        }
-    }
-}
 
 //enum EntryTag {
 //    Empty,
@@ -299,7 +280,7 @@ impl Map {
         if_resizing!(self, {
             let (entry, ptr) = self.find(k, &self.prev_table);
             match entry {
-                Some(entry) => Entry::set_val(ptr, 3),
+                Some(_) => Entry::set_val(ptr, 3),
                 None => {}
             }
         }, {});
@@ -344,16 +325,14 @@ impl Map {
                     }
                 },
                 None => {
-                    unsafe {
-                        let (val, ok) = Entry::cas_key(ptr, 0, k);
-                        if !ok {
-                            slot = self.table_slot(slot + 1, &table);
-                            continue;
-                        }
-                        match v {
-                            Some(v) => Entry::set_val(ptr, v),
-                            None => {}
-                        }
+                    let (_, ok) = Entry::cas_key(ptr, 0, k);
+                    if !ok {
+                        slot = self.table_slot(slot + 1, &table);
+                        continue;
+                    }
+                    match v {
+                        Some(v) => Entry::set_val(ptr, v),
+                        None => {}
                     }
                     result = None;
                     break;
@@ -433,10 +412,3 @@ impl Drop for Map {
         }
     }
 }
-
-struct HashMap<K, V, H> {
-    hasher_factory: H,
-    kp: PhantomData<K>,
-    vp: PhantomData<V>,
-}
-
