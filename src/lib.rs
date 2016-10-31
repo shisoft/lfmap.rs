@@ -96,7 +96,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    pub fn new_from(ptr: u64) -> Option<Entry> {
+    fn new_from(ptr: u64) -> Option<Entry> {
         unsafe {
             let ptr = ptr as u64;
             let key = intrinsics::atomic_load(ptr as *mut KV);
@@ -120,17 +120,17 @@ impl Entry {
             }
         }
     }
-    pub fn cas_val(ptr: u64, old: KV, new: KV) -> (KV, bool) {
+    fn cas_val(ptr: u64, old: KV, new: KV) -> (KV, bool) {
         unsafe {
             intrinsics::atomic_cxchg((ptr + KV_BYTES_U64) as *mut KV, old, new)
         }
     }
-    pub fn set_val(ptr: u64, val: KV) {
+    fn set_val(ptr: u64, val: KV) {
         unsafe {
             intrinsics::atomic_store((ptr + KV_BYTES_U64) as *mut KV, val);
         }
     }
-    pub fn cas_val_to(ptr: u64, new: KV) -> KV {
+    fn cas_val_to(ptr: u64, new: KV) -> KV {
         let ptr = ptr + KV_BYTES_U64;
         unsafe {
             let mut old = intrinsics::atomic_load(ptr as *mut KV);
@@ -144,12 +144,12 @@ impl Entry {
             }
         }
     }
-    pub fn load_val(ptr: u64) -> KV {
+    fn load_val(ptr: u64) -> KV {
         unsafe {
             intrinsics::atomic_load_relaxed((ptr + KV_BYTES_U64) as *mut KV)
         }
     }
-    pub fn cas_key(ptr: u64, old: KV, new:KV) -> (KV, bool) {
+    fn cas_key(ptr: u64, old: KV, new:KV) -> (KV, bool) {
         unsafe {
             intrinsics::atomic_cxchg(ptr as *mut KV, old, new)
         }
