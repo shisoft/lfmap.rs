@@ -48,6 +48,7 @@ pub struct Table {
     cap: AtomicUsize,
     chunk: AtomicUsize,
     new_chunk: AtomicUsize,
+    occupation: AtomicUsize,
     val_bit_mask: usize, // 0111111..
     inv_bit_mask: usize  // 1000000..
 }
@@ -68,6 +69,7 @@ impl Table {
             cap: AtomicUsize::new(cap),
             chunk: AtomicUsize::new(chunk),
             new_chunk: AtomicUsize::new(chunk),
+            occupation: AtomicUsize::new(0),
             val_bit_mask,
             inv_bit_mask: !val_bit_mask
         }
@@ -203,18 +205,29 @@ impl Table {
                 }
 
             } else if k == EMPTY_KEY {
-                if let ModOp::Insert(value) = op {
+                let put_in_empty = |value| {
                     // found empty slot, try to CAS key and value
                     if self.cas_value(addr, 0, value) {
                         // CAS value succeed, shall store key
                         unsafe { intrinsics::atomic_store_relaxed(addr as *mut usize, key) }
-                        return match replaced {
+                        self.occupation.fetch_add(1, Relaxed);
+                        match replaced {
                             Some(v) => ModResult::Replaced(v),
                             None => ModResult::Done
                         }
                     } else {
                         // CAS failed, this entry have been taken, reprobe
+                        ModResult::Fail(0)
                     }
+                };
+                let mod_res = match op {
+                    ModOp::Insert(val) => put_in_empty(val),
+                    ModOp::Sentinel => put_in_empty(SENTINEL_VALUE),
+                    _ => unreachable!()
+                };
+                match &mod_res {
+                    ModResult::Fail(_) => {},
+                    _ => return mod_res
                 }
             }
             idx += 1; // reprobe

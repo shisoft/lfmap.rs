@@ -2,7 +2,7 @@ extern crate lfmap;
 use lfmap::*;
 
 #[test]
-pub fn general() {
+pub fn will_not_overflow() {
     let table = Table::with_capacity(16);
     for i in 50..60 {
         assert_eq!(table.insert(i, i), None);
