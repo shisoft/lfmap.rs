@@ -10,10 +10,10 @@ pub fn general() {
     for i in 50..60 {
         assert_eq!(table.get(i), Some(i));
     }
-    for i in 50..60 {
+    for i in 50..56 {
         assert_eq!(table.insert(i, 10), Some(i));
     }
-    for i in 50..60 {
+    for i in 50..56 {
         assert_eq!(table.get(i), Some(10), "Check replace {}", i);
     }
 }

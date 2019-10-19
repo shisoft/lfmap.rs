@@ -143,7 +143,11 @@ impl Table {
             let addr = base + idx * entry_size;
             let k = self.get_key(addr);
             if k == key {
-                return self.get_value(addr);
+                let val_res = self.get_value(addr);
+                match val_res.parsed {
+                    ParsedValue::Empty => {},
+                    _ => return val_res
+                }
             }
             if k == EMPTY_KEY {
                 return Value::new(0, self);
@@ -186,7 +190,9 @@ impl Table {
                             }
                         }
                         match op {
-                            ModOp::Empty => return ModResult::Replaced(*v),
+                            ModOp::Empty => {
+                                return ModResult::Replaced(*v)
+                            }
                             _ => {}
                         }
                     }
