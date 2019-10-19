@@ -1,496 +1,285 @@
+#![no_std]
+#![feature(allocator_api)]
 #![feature(core_intrinsics)]
-#![feature(integer_atomics)]
+extern crate alloc;
 
-extern crate libc;
-extern crate core;
+// usize to usize lock-free, wait free table
 
-use core::intrinsics;
-use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::{thread, time};
+use alloc::alloc::Global;
+use core::alloc::{Alloc, Layout};
+use core::{mem, ptr, intrinsics};
+use core::sync::atomic::{AtomicUsize, AtomicPtr};
+use core::sync::atomic::Ordering::Relaxed;
+use core::iter::Copied;
 
-const INITIAL_CAPACITY :u64 = 32;
-type KV = u64;
-const KV_BYTES: usize = (64 / 8);
-const KV_BYTES_U64: u64 = KV_BYTES as u64;
+type EntryTemplate = (usize, usize);
 
+const EMPTY_KEY: usize = 0;
+const EMPTY_VALUE: usize = 0;
+const SENTINEL_VALUE: usize = 1;
 
-macro_rules! if_resizing {
-    (
-        $map: ident, $if_exp: expr, $else_exp: expr
-    ) => (
-        {
-            let response;
-            loop {
-                let resizing_counter = $map.resizing.load(Ordering::SeqCst);
-                if $map.prev_table.load(Ordering::SeqCst) != 0 && resizing_counter != 0 {
-                    let prev_count = $map.resizing.compare_and_swap(resizing_counter, resizing_counter + 1, Ordering::SeqCst);
-                    if prev_count != resizing_counter {
-                        continue;
-                    } else {
-                        response = $if_exp;
-                        $map.resizing.fetch_sub(1, Ordering::SeqCst);
-                        break;
-                    }
-                } else {
-                    response = $else_exp;
-                    break;
-                }
-            }
-            response
-        }
-    );
- }
-
-//enum EntryTag {
-//    Empty,
-//    LIVE,
-//    DEAD,
-//    MOVED
-//}
-
-struct Table {
-    body_addr: u64,
-    capacity: u64,
-    contained: u64,
-    meta_addr: u64, // not in the memory
-
+struct Value {
+    raw: usize,
+    parsed: ParsedValue
 }
+
+enum ParsedValue {
+    Val(usize),
+    Prime(usize),
+    Sentinel,
+    Empty
+}
+
+enum ModResult {
+    Replaced(usize),
+    Fail(usize),
+    Sentinel,
+    NotFound,
+    Done
+}
+
+enum ModOp {
+    Insert(usize),
+    Sentinel,
+    Empty
+}
+
+pub struct Table {
+    cap: AtomicUsize,
+    chunk: AtomicUsize,
+    new_chunk: AtomicUsize,
+    val_bit_mask: usize, // 0111111..
+    inv_bit_mask: usize  // 1000000..
+}
+
 impl Table {
-    fn to_raw(&self) -> u64 {
-        unsafe {
-            let mptr = libc::malloc(3 * KV_BYTES) as usize;
-            ptr::write(mptr as *mut KV, self.body_addr);
-            ptr::write((mptr + KV_BYTES) as *mut KV, self.capacity);
-            ptr::write((mptr + KV_BYTES * 2) as *mut KV, self.contained);
-            mptr as u64
+    pub fn with_capacity(cap: usize) -> Self {
+        if !is_power_of_2(cap) {
+            panic!("capacity is not power of 2");
+        }
+        // Each entry key value pair is 2 words
+        let chunk_size = cap * mem::size_of::<EntryTemplate>();
+        let align = mem::align_of::<EntryTemplate>();
+        let layout = Layout::from_size_align(chunk_size, align).unwrap();
+        let chunk = unsafe { Global.alloc(layout) }.unwrap().as_ptr() as usize;
+        // steal 1 bit in the MSB of value indicate Prime(1)
+        let val_bit_mask = !0 << 1 >> 1;
+        Self {
+            cap: AtomicUsize::new(cap),
+            chunk: AtomicUsize::new(chunk),
+            new_chunk: AtomicUsize::new(chunk),
+            val_bit_mask,
+            inv_bit_mask: !val_bit_mask
         }
     }
-    fn from_raw(ptr: &AtomicU64) -> Table {
-        let mptr = ptr.load(Ordering::SeqCst) as usize;
-        unsafe {
-            Table {
-                body_addr: ptr::read(mptr as *mut KV),
-                capacity: ptr::read((mptr + KV_BYTES) as *mut KV),
-                contained: ptr::read((mptr + KV_BYTES * 2) as *mut KV), 
-                meta_addr: mptr as u64
+
+    pub fn new() -> Self {
+        Self::with_capacity(64)
+    }
+
+    pub fn get(&self, key: usize) -> Option<usize> {
+
+        let mut base = self.chunk.load(Relaxed);
+        loop {
+            let val = self.get_from_chunk(base, key);
+            match val.parsed {
+                ParsedValue::Prime(val) | ParsedValue::Val(val) => return Some(val),
+                ParsedValue::Sentinel => {
+                    let new_chunk = self.new_chunk.load(Relaxed);
+                    debug_assert_ne!(new_chunk, 0);
+                    debug_assert_ne!(base, new_chunk);
+                    base = new_chunk;
+                }
+                ParsedValue::Empty => return None
             }
         }
     }
-    fn incr_contained(&self) -> u64 {
-        unsafe {
-            intrinsics::atomic_xadd((self.meta_addr + KV_BYTES_U64 * 2) as *mut KV, 1)
+
+    pub fn insert(&self, key: usize, value: usize) -> Option<usize> {
+        let new_chunk = self.new_chunk.load(Relaxed);
+        let old_chunk = self.chunk.load(Relaxed);
+        let copying = new_chunk != old_chunk;
+        let value_insertion = self.modify_entry(new_chunk, key, ModOp::Insert(value));
+        let mut result = None;
+        match value_insertion {
+            ModResult::Done => {},
+            ModResult::Replaced(v) => {
+                result = Some(v)
+            }
+            ModResult::Fail(v) => {
+                // don't handle failure by return the value
+                return Some(v);
+            }
+            _ => unreachable!()
+        };
+        if copying {
+            self.modify_entry(old_chunk, key, ModOp::Sentinel);
+        }
+        result
+    }
+
+    pub fn remove(&self, key: usize) -> Option<usize> {
+        let new_chunk = self.new_chunk.load(Relaxed);
+        let old_chunk = self.chunk.load(Relaxed);
+        let copying = new_chunk != old_chunk;
+        let res = self.modify_entry(new_chunk, key, ModOp::Empty);
+        if copying {
+            self.modify_entry(new_chunk, key, ModOp::Sentinel);
+        }
+        match res {
+            ModResult::Replaced(v) => Some(v),
+            _ => None
         }
     }
-    fn contained(&self) -> u64 {
-        unsafe {
-            intrinsics::atomic_load((self.meta_addr + KV_BYTES_U64 * 2) as *mut KV)
+
+    fn get_from_chunk(&self, base: usize, key: usize) -> Value {
+        let size = self.cap.load(Relaxed);
+        let mut idx = key;
+        let entry_size = mem::size_of::<EntryTemplate>();
+        let cap = self.cap.load(Relaxed);
+        let mut counter = 0;
+        while counter < cap {
+            idx &= (size - 1);
+            let addr = base + idx * entry_size;
+            let k = self.get_key(addr);
+            if k == key {
+                return self.get_value(addr);
+            }
+            if k == EMPTY_KEY {
+                return Value::new(0, self);
+            }
+            idx += 1; // reprobe
+            counter += 1;
         }
+
+        // not found
+        return Value::new(0, self);
     }
-}
 
-pub struct Entry {
-    key: u64,
-    val: u64,
-    tag: u64,
-}
-
-impl Entry {
-    fn new_from(ptr: u64) -> Option<Entry> {
-        unsafe {
-            let ptr = ptr as u64;
-            let key = intrinsics::atomic_load(ptr as *mut KV);
-            let val_ptr = ptr + KV_BYTES_U64;
-            let val = intrinsics::atomic_load(val_ptr as *mut KV);
-            if key == 0 || val == 0 {
-                None
-            } else {
-                Some(
-                    Entry {
-                        tag: {
-                            match val {
-                                2 | 3 => val,
-                                _ => 1,
+    fn modify_entry(&self, base: usize, key: usize, op: ModOp) -> ModResult {
+        let mut idx = key;
+        let cap = self.cap.load(Relaxed);
+        let entry_size = mem::size_of::<EntryTemplate>();
+        let mut replaced = None;
+        let mut count = 0;
+        while count <= cap {
+            idx &= (cap - 1);
+            let addr = base + idx * entry_size;
+            let k = self.get_key(addr);
+            if k == key {
+                let val = self.get_value(addr);
+                match &val.parsed {
+                    ParsedValue::Val(v) | ParsedValue::Prime(v) => {
+                        match op {
+                            ModOp::Sentinel => {
+                                self.set_sentinel(addr);
+                                return ModResult::Done;
                             }
-                        },
-                        key: key,
-                        val: val
+                            ModOp::Empty | ModOp::Insert(_) => {
+                                if !self.set_tombstone(addr, val.raw) {
+                                    // this insertion have conflict with others, abort
+                                    return ModResult::Fail(*v);
+                                } else {
+                                    // we have put tombstone on the value
+                                    replaced = Some(*v);
+                                }
+                            }
+                        }
+                        match op {
+                            ModOp::Empty => return ModResult::Replaced(*v),
+                            _ => {}
+                        }
                     }
-                )
-            }
-        }
-    }
-    fn cas_val(ptr: u64, old: KV, new: KV) -> (KV, bool) {
-        unsafe {
-            intrinsics::atomic_cxchg((ptr + KV_BYTES_U64) as *mut KV, old, new)
-        }
-    }
-    fn set_val(ptr: u64, val: KV) {
-        unsafe {
-            intrinsics::atomic_store((ptr + KV_BYTES_U64) as *mut KV, val);
-        }
-    }
-    fn cas_val_to(ptr: u64, new: KV) -> KV {
-        let ptr = ptr + KV_BYTES_U64;
-        unsafe {
-            let mut old = intrinsics::atomic_load(ptr as *mut KV);
-            loop {
-                let (val, ok) = intrinsics::atomic_cxchg(ptr as *mut KV, old, new);
-                if ok {
-                    return old;
-                } else {
-                    old = val;
+                    ParsedValue::Empty => {
+                        // found the key with empty value, shall do nothing and continue probing
+                    },
+                    ParsedValue::Sentinel => return ModResult::Sentinel // should not reachable for insertion happens on new list
+                }
+
+            } else if k == EMPTY_KEY {
+                if let ModOp::Insert(value) = op {
+                    // found empty slot, try to CAS key and value
+                    if self.cas_value(addr, 0, value) {
+                        // CAS value succeed, shall store key
+                        unsafe { intrinsics::atomic_store_relaxed(addr as *mut usize, key) }
+                        return match replaced {
+                            Some(v) => ModResult::Replaced(v),
+                            None => ModResult::Done
+                        }
+                    } else {
+                        // CAS failed, this entry have been taken, reprobe
+                    }
                 }
             }
+            idx += 1; // reprobe
+            count += 1;
+        }
+        match op {
+            ModOp::Insert(_) => panic!("Table is full, cannot insert into"),
+            _ => return ModResult::NotFound
         }
     }
-    fn load_val(ptr: u64) -> KV {
-        unsafe {
-            intrinsics::atomic_load_relaxed((ptr + KV_BYTES_U64) as *mut KV)
-        }
+
+    #[inline(always)]
+    fn get_key(&self, entry_addr: usize) -> usize {
+        unsafe { intrinsics::atomic_load_relaxed(entry_addr as *mut usize) }
     }
-    fn cas_key(ptr: u64, old: KV, new:KV) -> (KV, bool) {
-        unsafe {
-            intrinsics::atomic_cxchg(ptr as *mut KV, old, new)
+
+    #[inline(always)]
+    fn get_value(&self, entry_addr: usize) -> Value {
+        let addr = entry_addr + mem::size_of::<usize>();
+        let val = unsafe { intrinsics::atomic_load_relaxed(addr as *mut usize) };
+        Value::new(val, self)
+    }
+
+    #[inline(always)]
+    fn set_tombstone(&self, entry_addr: usize, original: usize) -> bool {
+        self.cas_value(entry_addr, original, 0)
+    }
+    #[inline(always)]
+    fn set_sentinel(&self, entry_addr: usize) {
+        let addr = entry_addr + mem::size_of::<usize>();
+        unsafe { intrinsics::atomic_store_relaxed(addr as *mut usize, SENTINEL_VALUE) }
+    }
+    #[inline(always)]
+    fn cas_value(&self, entry_addr: usize, original: usize, value: usize) -> bool {
+        let addr = entry_addr + mem::size_of::<usize>();
+        unsafe { intrinsics::atomic_cxchg_relaxed(addr as *mut usize, original, value).0 == original }
+    }
+}
+
+impl Value {
+    pub fn new(val: usize, table: &Table) -> Self {
+        let res = {
+            if val == 0 {
+                ParsedValue::Empty
+            } else {
+                let actual_val = val & table.val_bit_mask;
+                let flag = val & table.inv_bit_mask;
+                if flag == 1 {
+                    ParsedValue::Prime(actual_val)
+                } else if actual_val == 1 {
+                    ParsedValue::Sentinel
+                } else {
+                    ParsedValue::Val(actual_val)
+                }
+            }
+        };
+        Value {
+            raw: val,
+            parsed: res
         }
     }
 }
 
-pub struct Map {
-    curr_table: AtomicU64,
-    prev_table: AtomicU64,
-    entry_size: u64,
-
-    resizing: AtomicU64,
-}
-
-fn new_table_body(entry_size: u64, capacity: u64) -> u64 {
-    let table_size = (entry_size * capacity) as usize;
-    let addr = unsafe{libc::malloc(table_size)} as u64;
-    unsafe {
-        libc::memset(addr as *mut libc::c_void, 0, table_size);
-    }
-    addr
-}
-fn is_power_of_2(num: u64) -> bool {
+fn is_power_of_2(num: usize) -> bool {
     if num < 1 {return false}
     if num <= 2 {return true}
     if num % 2 == 1 {return false};
     return is_power_of_2(num / 2);
 }
-impl Map {
-    pub fn with_options(capacity: u64) -> Map {
-        if !is_power_of_2(capacity) {
-            panic!("Capacity must be power of 2 but got: {}", capacity);
-        }
-        let entry_size = KV_BYTES * 2;
-        let table_body_addr = new_table_body(entry_size as u64, capacity);
-        Map {
-            curr_table: AtomicU64::new(
-                Table{
-                    body_addr: table_body_addr,
-                    capacity: capacity,
-                    meta_addr: 0,
-                    contained: 0
-                }.to_raw()
-            ),
-            prev_table: AtomicU64::new(0),
-            entry_size: entry_size as u64,
-            resizing: AtomicU64::new(0),
-        }
-    }
-    pub fn new() -> Map {
-        Map::with_options(INITIAL_CAPACITY)
-    }
-    fn current(&self) -> &AtomicU64 {
-        &self.curr_table
-    }
-    fn find(&self, k: u64, table_ptr: &AtomicU64) -> (Option<Entry>, KV) {
-        let table = Table::from_raw(table_ptr);
-        let hash = k;
-        let mut slot = self.table_slot(hash, &table);
-        loop {
-            let ptr = table.body_addr + slot * self.entry_size;
-            let entry = Entry::new_from(ptr);
-            match entry {
-                Some(entry) => {
-                    if entry.key != k {
-                        slot = self.table_slot(slot + 1, &table);
-                    } else {
-                        return (Some(entry), ptr)
-                    }
-                },
-                None => return (None, ptr)
-            }
-        };
-    }
-    fn resize(&self) -> bool {
-        if self.resizing.compare_and_swap(0, 1, Ordering::SeqCst) == 0 {
-            assert_eq!(self.prev_table.load(Ordering::SeqCst), 0);
-            let prev_table = Table::from_raw(&self.curr_table);
-            let new_capacity = prev_table.capacity * 2;
-            let new_addr = new_table_body(self.entry_size, new_capacity);
-            self.prev_table.store(self.curr_table.load(Ordering::SeqCst), Ordering::SeqCst);
-            self.curr_table.store(
-                Table{
-                    body_addr: new_addr,
-                    capacity: new_capacity,
-                    contained: 0,
-                    meta_addr: 0,
-                }.to_raw(), Ordering::SeqCst);
-            let new_table = Table::from_raw(&self.curr_table);
-            let mut prev_clear = true;
-            loop {
-                for slot in 0..prev_table.capacity {
-                    let ptr = prev_table.body_addr + slot * self.entry_size;
-                    let entry = Entry::new_from(ptr);
-                    match entry {
-                        Some(entry) => {
-                            match entry.tag {
-                                1 => {
-                                    self.insert_to_table(&new_table, entry.key, None, Some(Entry::load_val(ptr)));
-                                    Entry::set_val(ptr, 3);
-                                    prev_clear = false;
-                                }
-                                _ => {},
-                            }
-                        },
-                        None => {}
-                    }
-                }
-                if prev_clear {
-                    break;
-                } else {
-                    prev_clear = true;
-                }
-            }
-            while self.resizing.compare_and_swap(1, 0, Ordering::SeqCst) != 1 {}
-            self.prev_table.store(0, Ordering::SeqCst);
-            unsafe {
-                libc::free(prev_table.body_addr as *mut libc::c_void);
-                libc::free(prev_table.meta_addr as *mut libc::c_void);
-            }
-            true
-        } else {
-            thread::sleep(time::Duration::from_millis(1)); //weird, but essential
-            false
-        }
-    }
-    fn set_entry_moved(&self, k: KV) {
-        if_resizing!(self, {
-            let (entry, ptr) = self.find(k, &self.prev_table);
-            match entry {
-                Some(_) => Entry::set_val(ptr, 3),
-                None => {}
-            }
-        }, {});
-    }
 
-    pub fn insert(&self, k: u64, v: u64) -> Option<KV> {
-        if k == 0 {panic!("key: {} is reserved for internal use", k)}
-        match v {
-            0 | 2 | 3 => panic!("value: {} is reserved for internal use", v),
-            _ => {}
-        }
-        let mut table = Table::from_raw(&self.current());
-        while table.contained() > table.capacity / 2  {
-            self.resize();
-            table = Table::from_raw(&self.current());
-        }
-        self.insert_to_table(&table, k, None, Some(v))
-    }
-    fn insert_to_table(&self, table: &Table, k: KV, expected: Option<KV>, v: Option<KV>) -> Option<KV> {
-        let hash = k;
-        let mut slot = self.table_slot(hash, &table);
-        let mut result = None;
-        loop {
-            let ptr = table.body_addr + slot * self.entry_size;
-            let entry = Entry::new_from(ptr);
-            match entry {
-                Some(entry) => {
-                    if entry.key != k {
-                        slot = self.table_slot(slot + 1, &table);
-                        continue;
-                    } else {
-                        match v {
-                            Some(v) => {
-                                match expected {
-                                    None => {
-                                        result = Some(Entry::cas_val_to(ptr, v));
-                                    }
-                                    Some(exp_v) => {
-                                        let (pv, _) = Entry::cas_val(ptr, exp_v, v);
-                                        result = Some(pv);
-                                    }
-                                }
-                            },
-                            None => {
-                                result = Some(entry.val);
-                            }
-                        }
-                        break;
-                    }
-                },
-                None => {
-                    match expected {
-                        None | Some(0) => {
-                            let (_, ok) = Entry::cas_key(ptr, 0, k);
-                            if !ok {
-                                slot = self.table_slot(slot + 1, &table);
-                                continue;
-                            }
-                            match v {
-                                Some(v) => {
-                                    match expected {
-                                        None => {
-                                            Entry::set_val(ptr, v);
-                                        },
-                                        Some(0) => {
-                                            let (prev, _) = Entry::cas_val(ptr, 0, v);
-                                            result = Some(prev);
-                                        }
-                                        _ => {}
-                                    }
-                                },
-                                None => {}
-                            }
-                            table.incr_contained();
-                            break;
-                        },
-                        Some(_) => {return None;}
-                    }
-                }
-            }
-        };
-        self.set_entry_moved(k);
-        match result {
-            None => None,
-            Some(0) | Some(1) | Some(2) | Some(3) => None,
-            _ => result,
-        }
-    }
-    pub fn update_if(&self, k: KV, expected: KV, v: KV) -> Option<KV> {
-        let update_current = |expected| {
-            self.insert_to_table(&Table::from_raw(&self.curr_table), k, Some(expected), Some(v))
-        };
-        if_resizing!(self, {
-            let (prev_entry, _) = self.find(k, &self.prev_table);
-            match prev_entry {
-                None => update_current(expected),
-                Some(prev_entry) => {
-                    match prev_entry.tag {
-                        1 => {
-                            let prev_val = prev_entry.val;
-                            let mut curr_tb_prev = None;
-                            if prev_val == expected {
-                                curr_tb_prev = update_current(0);
-                            }
-                            match curr_tb_prev {
-                                None | Some(0) => Some(prev_val),
-                                Some(pv) => Some(pv)
-                            }
-                        }
-                        _ => update_current(expected),
-                    }
-                }
-            }
-        }, {
-            update_current(expected)
-        })
-    }
-    pub fn compute<U: Fn(KV, KV) -> KV>(&self, k: KV, compute_val: U) -> Option<KV> {
-        let mut val_opt = self.get(k);
-        loop {
-            match val_opt {
-                Some(val) => {
-                    let computed = compute_val(k, val);
-                    let update_res = self.update_if(k, val, computed);
-                    match update_res {
-                        Some(update_res) => {
-                            if update_res == val {
-                                return Some(computed);
-                            } else {
-                                val_opt = Some(update_res);
-                                continue;
-                            }
-                        },
-                        None => {
-                            return None;
-                        }
-                    }
-                },
-                None => {
-                    return None;
-                }
-            }
-        }
-    }
-    fn get_from_entry_ptr(&self, entry: Option<Entry>) -> Option<KV> {
-        match entry {
-            Some(entry) => {
-                match entry.tag {
-                    1 => Some(entry.val),
-                    _ => None,
-                }
-            },
-            None => None
-        }
-    }
-    pub fn get(&self, k: KV) -> Option<KV> {
-        let read_current = || {
-            let (entry, _) = self.find(k, &self.current());
-            self.get_from_entry_ptr(entry)
-        };
-        if_resizing!(self, {
-            let (prev_entry, _) = self.find(k, &self.prev_table);
-            match prev_entry {
-                None => read_current(),
-                Some(prev_entry) => {
-                    match prev_entry.tag {
-                        3 | 0 => read_current(),
-                        1 => {
-                            self.get_from_entry_ptr(Some(prev_entry))
-                        }
-                        _ => None
-                    }
-                }
-            }
-        }, {
-            read_current()
-        })
-    }
-    pub fn remove(&self, k: KV) -> Option<KV> {
-        let curr_t_val = self.insert_to_table(&Table::from_raw(&self.current()), k, None, Some(2));
-        let mut prev_t_val = None;
-        if_resizing!(self, {
-            let prev_table = Table::from_raw(&self.prev_table);
-            prev_t_val = self.insert_to_table(&prev_table, k, None, Some(3));
-        }, {});
-        if curr_t_val.is_some() {
-            curr_t_val
-        } else {
-            prev_t_val
-        }
-    }
-    fn table_slot(&self, hash: u64, table: &Table) -> u64 {
-        hash & (table.capacity - 1)
-    }
-    pub fn capacity(&self) -> u64 {
-        Table::from_raw(&self.current()).capacity
-    }
-}
-impl Drop for Map {
-    fn drop(&mut self) {
-        let curr_table = Table::from_raw(&self.curr_table);
-        let have_prev_table = self.prev_table.load(Ordering::SeqCst) != 0;
-        unsafe {
-            if have_prev_table {
-                let prev_table = Table::from_raw(&self.prev_table);
-                libc::free(prev_table.body_addr as *mut libc::c_void);
-                libc::free(prev_table.meta_addr as *mut libc::c_void);
-            }
-            libc::free(curr_table.body_addr as *mut libc::c_void);
-            libc::free(curr_table.meta_addr as *mut libc::c_void);
-        }
-    }
+#[cfg(test)]
+mod tests {
+
 }
