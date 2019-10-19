@@ -125,8 +125,11 @@ impl Table {
         let old_chunk = self.chunk.load(Relaxed);
         let copying = new_chunk != old_chunk;
         let res = self.modify_entry(new_chunk, key, ModOp::Empty);
-        if copying {
-            self.modify_entry(new_chunk, key, ModOp::Sentinel);
+        match res {
+            ModResult::Done | ModResult::Replaced(_) => if copying {
+                self.modify_entry(new_chunk, key, ModOp::Sentinel);
+            }
+            _ => {}
         }
         match res {
             ModResult::Replaced(v) => Some(v),
@@ -135,13 +138,12 @@ impl Table {
     }
 
     fn get_from_chunk(&self, base: usize, key: usize) -> Value {
-        let size = self.cap.load(Relaxed);
         let mut idx = key;
         let entry_size = mem::size_of::<EntryTemplate>();
         let cap = self.cap.load(Relaxed);
         let mut counter = 0;
         while counter < cap {
-            idx &= (size - 1);
+            idx &= (cap - 1);
             let addr = base + idx * entry_size;
             let k = self.get_key(addr);
             if k == key {
