@@ -6,3 +6,6 @@ authors = ["Jack Shi <shisoftgenius@gmail.com>"]
 [dependencies]
 libc = "*"
 log = "*"
+
+[dev-dependencies]
+env_logger = "0.7.1"

@@ -15,6 +15,7 @@ use core::iter::Copied;
 use core::cmp::Ordering;
 use core::ptr::NonNull;
 use ModOp::Empty;
+use alloc::string::String;
 
 type EntryTemplate = (usize, usize);
 
@@ -105,11 +106,13 @@ impl Table {
     }
 
     pub fn insert(&self, key: usize, value: usize) -> Option<usize> {
+        debug!("Inserting key: {}, value: {}", key, value);
         let new_chunk = self.new_chunk.load(Relaxed);
         let old_chunk = self.chunk.load(Relaxed);
         let cap = self.cap.load(Relaxed);
         let copying = new_chunk != old_chunk;
         if !copying && self.check_resize(old_chunk, cap) {
+            debug!("Resized, retry insertion key: {}, value {}", key, value);
             return self.insert(key, value)
         }
         let value_insertion = self.modify_entry(new_chunk, key, ModOp::Insert(value), cap);
@@ -240,7 +243,11 @@ impl Table {
                     }
                 };
                 let mod_res = match op {
-                    ModOp::Insert(val) | ModOp::AttemptInsert(val) => put_in_empty(val),
+                    ModOp::Insert(val) | ModOp::AttemptInsert(val) => {
+                        debug!("Inserting entry key: {}, value: {}, raw: {:b}, addr: {}",
+                               key, val & self.val_bit_mask, val, addr);
+                        put_in_empty(val)
+                    },
                     ModOp::Sentinel => put_in_empty(SENTINEL_VALUE),
                     _ => unreachable!()
                 };
@@ -315,6 +322,7 @@ impl Table {
                         ParsedValue::Val(v) => {
                             // Insert entry into new chunk, in case of failure, skip this entry
                             // Value should be primed
+                            debug!("Moving key: {}, value: {}", key, v);
                             let primed_val = value.raw | self.inv_bit_mask;
                             let new_chunk_insertion = self.modify_entry(
                                 new_base,
@@ -343,6 +351,8 @@ impl Table {
                                     let stripped = primed_val & self.val_bit_mask;
                                     debug_assert_ne!(stripped, SENTINEL_VALUE);
                                     if self.cas_value(entry_addr, primed_val, stripped) {
+                                        debug!("Effective copy key: {}, value {}, addr: {}",
+                                               key, stripped, entry_addr);
                                         effective_copy += 1;
                                     }
                                 } else {
@@ -359,9 +369,11 @@ impl Table {
                         ParsedValue::Sentinel => {
                             // Sentinel, skip
                             // Sentinel in old chunk implies its new value have already in the new chunk
+                            debug!("Skip copy sentinel");
                         }
                         ParsedValue::Empty => {
                             // Empty, skip
+                            debug!("Skip copy empty, key: {}", key);
                         }
                     }
                 }
@@ -374,9 +386,23 @@ impl Table {
             } else {
                 self.occupation.fetch_add((-changes) as usize, Relaxed);
             }
-            self.chunk.store(new_base, Relaxed);
+            debug_assert_ne!(old_chunk, new_base);
+            if self.chunk.compare_and_swap(old_chunk, new_base, Relaxed) != old_chunk {
+                panic!();
+            }
+            debug!("{}", self.dump(new_base, new_cap));
+            return true;
         }
         false
+    }
+
+    fn dump(&self, base: usize, cap: usize) -> &str {
+        for i in 0..cap {
+            let addr = base + i * entry_size();
+            debug!("{}-{}\t", self.get_key(addr), self.get_value(addr).raw);
+            if i % 8 == 0 { debug!("") }
+        }
+        "DUMPED"
     }
 }
 

@@ -3,6 +3,7 @@ use lfmap::*;
 
 #[test]
 pub fn will_not_overflow() {
+    env_logger::init();
     let table = Table::with_capacity(16);
     for i in 50..60 {
         assert_eq!(table.insert(i, i), None);
