@@ -5,3 +5,4 @@ authors = ["Jack Shi <shisoftgenius@gmail.com>"]
 
 [dependencies]
 libc = "*"
+log = "*"

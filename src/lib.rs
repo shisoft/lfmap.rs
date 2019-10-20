@@ -2,15 +2,19 @@
 #![feature(allocator_api)]
 #![feature(core_intrinsics)]
 extern crate alloc;
-
+#[macro_use]
+extern crate log;
 // usize to usize lock-free, wait free table
 
 use alloc::alloc::Global;
 use core::alloc::{Alloc, Layout};
 use core::{mem, ptr, intrinsics};
-use core::sync::atomic::{AtomicUsize, AtomicPtr};
-use core::sync::atomic::Ordering::Relaxed;
+use core::sync::atomic::{AtomicUsize, AtomicPtr, fence};
+use core::sync::atomic::Ordering::{Relaxed, Acquire, Release};
 use core::iter::Copied;
+use core::cmp::Ordering;
+use core::ptr::NonNull;
+use ModOp::Empty;
 
 type EntryTemplate = (usize, usize);
 
@@ -30,16 +34,18 @@ enum ParsedValue {
     Empty
 }
 
+#[derive(Debug)]
 enum ModResult {
     Replaced(usize),
     Fail(usize),
     Sentinel,
     NotFound,
-    Done
+    Done(usize) // address of placement
 }
 
 enum ModOp {
     Insert(usize),
+    AttemptInsert(usize),
     Sentinel,
     Empty
 }
@@ -49,6 +55,8 @@ pub struct Table {
     chunk: AtomicUsize,
     new_chunk: AtomicUsize,
     occupation: AtomicUsize,
+    // floating-point multiplication is slow, cache this value and recompute every time when resize
+    occu_limit: AtomicUsize,
     val_bit_mask: usize, // 0111111..
     inv_bit_mask: usize  // 1000000..
 }
@@ -59,10 +67,8 @@ impl Table {
             panic!("capacity is not power of 2");
         }
         // Each entry key value pair is 2 words
-        let chunk_size = cap * mem::size_of::<EntryTemplate>();
-        let align = mem::align_of::<EntryTemplate>();
-        let layout = Layout::from_size_align(chunk_size, align).unwrap();
-        let chunk = unsafe { Global.alloc(layout) }.unwrap().as_ptr() as usize;
+        let chunk_size = chunk_size_of(cap);
+        let chunk = alloc(chunk_size);
         // steal 1 bit in the MSB of value indicate Prime(1)
         let val_bit_mask = !0 << 1 >> 1;
         Self {
@@ -70,6 +76,7 @@ impl Table {
             chunk: AtomicUsize::new(chunk),
             new_chunk: AtomicUsize::new(chunk),
             occupation: AtomicUsize::new(0),
+            occu_limit: AtomicUsize::new(occupation_limit(cap)),
             val_bit_mask,
             inv_bit_mask: !val_bit_mask
         }
@@ -100,23 +107,26 @@ impl Table {
     pub fn insert(&self, key: usize, value: usize) -> Option<usize> {
         let new_chunk = self.new_chunk.load(Relaxed);
         let old_chunk = self.chunk.load(Relaxed);
+        let cap = self.cap.load(Relaxed);
         let copying = new_chunk != old_chunk;
-        let value_insertion = self.modify_entry(new_chunk, key, ModOp::Insert(value));
+        if !copying && self.check_resize(old_chunk, cap) {
+            return self.insert(key, value)
+        }
+        let value_insertion = self.modify_entry(new_chunk, key, ModOp::Insert(value), cap);
         let mut result = None;
         match value_insertion {
-            ModResult::Done => {},
-            ModResult::Replaced(v) => {
+            ModResult::Done(_) => {},
+            ModResult::Replaced(v) | ModResult::Fail(v) => {
                 result = Some(v)
             }
-            ModResult::Fail(v) => {
-                // don't handle failure by return the value
-                return Some(v);
-            }
-            _ => unreachable!()
+            _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
         };
         if copying {
-            self.modify_entry(old_chunk, key, ModOp::Sentinel);
+            fence(Acquire);
+            self.modify_entry(old_chunk, key, ModOp::Sentinel, cap);
+            fence(Release);
         }
+        self.occupation.fetch_add(1, Relaxed);
         result
     }
 
@@ -124,10 +134,11 @@ impl Table {
         let new_chunk = self.new_chunk.load(Relaxed);
         let old_chunk = self.chunk.load(Relaxed);
         let copying = new_chunk != old_chunk;
-        let res = self.modify_entry(new_chunk, key, ModOp::Empty);
+        let cap = self.cap.load(Relaxed);
+        let res = self.modify_entry(new_chunk, key, ModOp::Empty, cap);
         match res {
-            ModResult::Done | ModResult::Replaced(_) => if copying {
-                self.modify_entry(new_chunk, key, ModOp::Sentinel);
+            ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
+                self.modify_entry(old_chunk, key, ModOp::Sentinel, cap);
             }
             _ => {}
         }
@@ -164,9 +175,8 @@ impl Table {
         return Value::new(0, self);
     }
 
-    fn modify_entry(&self, base: usize, key: usize, op: ModOp) -> ModResult {
+    fn modify_entry(&self, base: usize, key: usize, op: ModOp, cap: usize) -> ModResult {
         let mut idx = key;
-        let cap = self.cap.load(Relaxed);
         let entry_size = mem::size_of::<EntryTemplate>();
         let mut replaced = None;
         let mut count = 0;
@@ -175,22 +185,29 @@ impl Table {
             let addr = base + idx * entry_size;
             let k = self.get_key(addr);
             if k == key {
+                // Probing non-empty entry
                 let val = self.get_value(addr);
                 match &val.parsed {
                     ParsedValue::Val(v) | ParsedValue::Prime(v) => {
                         match op {
                             ModOp::Sentinel => {
                                 self.set_sentinel(addr);
-                                return ModResult::Done;
+                                return ModResult::Done(addr);
                             }
                             ModOp::Empty | ModOp::Insert(_) => {
                                 if !self.set_tombstone(addr, val.raw) {
-                                    // this insertion have conflict with others, abort
+                                    // this insertion have conflict with others
+                                    // other thread changed the value
+                                    // should fail (?)
                                     return ModResult::Fail(*v);
                                 } else {
                                     // we have put tombstone on the value
                                     replaced = Some(*v);
                                 }
+                            }
+                            ModOp::AttemptInsert(_) => {
+                                // Attempting insert existed entry, skip
+                                return ModResult::Fail(*v);
                             }
                         }
                         match op {
@@ -207,15 +224,15 @@ impl Table {
                 }
 
             } else if k == EMPTY_KEY {
+                // Probing empty entry
                 let put_in_empty = |value| {
                     // found empty slot, try to CAS key and value
                     if self.cas_value(addr, 0, value) {
                         // CAS value succeed, shall store key
                         unsafe { intrinsics::atomic_store_relaxed(addr as *mut usize, key) }
-                        self.occupation.fetch_add(1, Relaxed);
                         match replaced {
                             Some(v) => ModResult::Replaced(v),
-                            None => ModResult::Done
+                            None => ModResult::Done(addr)
                         }
                     } else {
                         // CAS failed, this entry have been taken, reprobe
@@ -223,7 +240,7 @@ impl Table {
                     }
                 };
                 let mod_res = match op {
-                    ModOp::Insert(val) => put_in_empty(val),
+                    ModOp::Insert(val) | ModOp::AttemptInsert(val) => put_in_empty(val),
                     ModOp::Sentinel => put_in_empty(SENTINEL_VALUE),
                     _ => unreachable!()
                 };
@@ -267,6 +284,100 @@ impl Table {
         let addr = entry_addr + mem::size_of::<usize>();
         unsafe { intrinsics::atomic_cxchg_relaxed(addr as *mut usize, original, value).0 == original }
     }
+
+    #[inline(always)]
+    fn check_resize(&self, old_chunk: usize, cap: usize) -> bool {
+        let occupation = self.occupation.load(Relaxed);
+        let occu_limit = self.occu_limit.load(Relaxed);
+        if occupation > occu_limit {
+            // resize
+            debug!("Resizing");
+            let new_cap = cap << 1;
+            let chunk_size = chunk_size_of(new_cap);
+            let new_base = alloc(chunk_size);
+            if self.new_chunk.compare_and_swap(old_chunk, new_base, Relaxed) != old_chunk {
+                // other thread have allocated new chunk and wins the competition, exit
+                dealloc(new_base, chunk_size);
+                return true;
+            }
+            self.occu_limit.store(occupation_limit(new_cap), Relaxed);
+            let mut old_address = old_chunk;
+            let boundary = old_chunk + chunk_size_of(cap);
+            let mut effective_copy = 0;
+            while old_address < boundary  {
+                // iterate the old chunk to extract entries that is NOT empty
+                let key = self.get_key(old_address);
+                let value = self.get_value(old_address);
+                if key != EMPTY_KEY // Empty entry, skip
+                {
+                    // Reasoning value states
+                    match &value.parsed {
+                        ParsedValue::Val(v) => {
+                            // Insert entry into new chunk, in case of failure, skip this entry
+                            // Value should be primed
+                            let primed_val = value.raw | self.inv_bit_mask;
+                            let new_chunk_insertion = self.modify_entry(
+                                new_base,
+                                key,
+                                ModOp::AttemptInsert(primed_val),
+                                new_cap
+                            );
+                            let inserted_addr = match new_chunk_insertion {
+                                ModResult::Done(addr) => Some(addr), // continue procedure
+                                ModResult::Fail(v) => None,
+                                ModResult::Replaced(_) => {
+                                    unreachable!("Attempt insert does not replace anything");
+                                }
+                                ModResult::Sentinel => {
+                                    unreachable!("New chunk should not have sentinel");
+                                }
+                                ModResult::NotFound => {
+                                    unreachable!()
+                                }
+                            };
+                            if let Some(entry_addr) = inserted_addr {
+                                fence(Acquire);
+                                // cas to ensure sentinel into old chunk
+                                if self.cas_value(old_address, value.raw, SENTINEL_VALUE) {
+                                    // strip prime
+                                    let stripped = primed_val & self.val_bit_mask;
+                                    debug_assert_ne!(stripped, SENTINEL_VALUE);
+                                    if self.cas_value(entry_addr, primed_val, stripped) {
+                                        effective_copy += 1;
+                                    }
+                                } else {
+                                    fence(Release);
+                                    continue; // retry this entry
+                                }
+                                fence(Release);
+                            }
+                        }
+                        ParsedValue::Prime(v) => {
+                            // Should never have prime in old chunk
+                            panic!("Prime in old chunk when resizing")
+                        }
+                        ParsedValue::Sentinel => {
+                            // Sentinel, skip
+                            // Sentinel in old chunk implies its new value have already in the new chunk
+                        }
+                        ParsedValue::Empty => {
+                            // Empty, skip
+                        }
+                    }
+                }
+                old_address += entry_size();
+            }
+            // resize finished, make changes on the numbers
+            let changes = occupation as isize - effective_copy;
+            if changes > 0 {
+                self.occupation.fetch_sub(changes as usize, Relaxed);
+            } else {
+                self.occupation.fetch_add((-changes) as usize, Relaxed);
+            }
+            self.chunk.store(new_base, Relaxed);
+        }
+        false
+    }
 }
 
 impl Value {
@@ -293,11 +404,47 @@ impl Value {
     }
 }
 
+impl ParsedValue {
+    pub fn unwrap(&self) -> usize {
+        match self {
+            ParsedValue::Val(v) | ParsedValue::Val(v) => *v,
+            _ => panic!()
+        }
+    }
+}
+
 fn is_power_of_2(num: usize) -> bool {
     if num < 1 {return false}
     if num <= 2 {return true}
     if num % 2 == 1 {return false};
     return is_power_of_2(num / 2);
+}
+
+#[inline(always)]
+fn occupation_limit(cap: usize) -> usize {
+    (cap as f64 * 0.8f64) as usize
+}
+
+#[inline(always)]
+fn entry_size() -> usize {
+    mem::size_of::<EntryTemplate>()
+}
+
+#[inline(always)]
+fn chunk_size_of(cap: usize) -> usize {
+    cap * entry_size()
+}
+
+fn alloc(size: usize) -> usize {
+    let align = mem::align_of::<EntryTemplate>();
+    let layout = Layout::from_size_align(size, align).unwrap();
+    unsafe { Global.alloc(layout) }.unwrap().as_ptr() as usize
+}
+
+fn dealloc(ptr: usize, size: usize) {
+    let align = mem::align_of::<EntryTemplate>();
+    let layout = Layout::from_size_align(size, align).unwrap();
+    unsafe { Global.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
 }
 
 #[cfg(test)]
