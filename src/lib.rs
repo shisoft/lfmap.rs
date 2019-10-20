@@ -307,6 +307,7 @@ impl Table {
                 dealloc(new_base, chunk_size);
                 return true;
             }
+            self.cap.store(new_cap, Relaxed);
             self.occu_limit.store(occupation_limit(new_cap), Relaxed);
             let mut old_address = old_chunk;
             let boundary = old_chunk + chunk_size_of(cap);
