@@ -9,13 +9,14 @@ extern crate log;
 use alloc::alloc::Global;
 use core::alloc::{Alloc, Layout};
 use core::{mem, ptr, intrinsics};
-use core::sync::atomic::{AtomicUsize, AtomicPtr, fence};
+use core::sync::atomic::{AtomicUsize, AtomicPtr, fence, AtomicBool};
 use core::sync::atomic::Ordering::{Relaxed, Acquire, Release};
 use core::iter::Copied;
 use core::cmp::Ordering;
 use core::ptr::NonNull;
 use ModOp::Empty;
 use alloc::string::String;
+use core::ops::Deref;
 
 type EntryTemplate = (usize, usize);
 
@@ -51,10 +52,15 @@ enum ModOp {
     Empty
 }
 
-#[derive(Copy, Clone)]
 pub struct Chunk {
     capacity: usize,
-    base: usize
+    base: usize,
+    referenced: AtomicUsize,
+    is_garbage: AtomicBool
+}
+
+pub struct ChunkRef {
+    chunk: *mut Chunk
 }
 
 pub struct Table {
@@ -91,14 +97,14 @@ impl Table {
     }
 
     pub fn get(&self, key: usize) -> Option<usize> {
-        let mut chunk = unsafe { Chunk::from_ptr(self.chunk.load(Relaxed)) };
+        let mut chunk = unsafe { Chunk::borrow(self.chunk.load(Relaxed)) };
         loop {
-            let val = self.get_from_chunk(&chunk, key);
+            let val = self.get_from_chunk(&*chunk, key);
             match val.parsed {
                 ParsedValue::Prime(val) | ParsedValue::Val(val) => return Some(val),
                 ParsedValue::Sentinel => {
                     let old_chunk_base = chunk.base;
-                    chunk = unsafe { Chunk::from_ptr(self.new_chunk.load(Relaxed)) };
+                    chunk = unsafe { Chunk::borrow(self.new_chunk.load(Relaxed)) };
                     debug_assert_ne!(old_chunk_base, chunk.base);
                 }
                 ParsedValue::Empty => return None
@@ -115,8 +121,8 @@ impl Table {
             debug!("Resized, retry insertion key: {}, value {}", key, value);
             return self.insert(key, value)
         }
-        let new_chunk = unsafe { Chunk::from_ptr(new_chunk_ptr) };
-        let value_insertion = self.modify_entry(&new_chunk, key, ModOp::Insert(value));
+        let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value));
         let mut result = None;
         match value_insertion {
             ModResult::Done(_) => {},
@@ -127,8 +133,8 @@ impl Table {
         };
         if copying {
             fence(Acquire);
-            let old_chunk = unsafe { Chunk::from_ptr(old_chunk_ptr) };
-            self.modify_entry(&old_chunk, key, ModOp::Sentinel);
+            let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
+            self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
             fence(Release);
         }
         self.occupation.fetch_add(1, Relaxed);
@@ -139,12 +145,12 @@ impl Table {
         let new_chunk_ptr = self.new_chunk.load(Relaxed);
         let old_chunk_ptr = self.chunk.load(Relaxed);
         let copying = new_chunk_ptr != old_chunk_ptr;
-        let new_chunk = unsafe { Chunk::from_ptr(new_chunk_ptr) };
-        let res = self.modify_entry(&new_chunk, key, ModOp::Empty);
+        let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
         match res {
             ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
-                let old_chunk = unsafe { Chunk::from_ptr(old_chunk_ptr) };
-                self.modify_entry(&old_chunk, key, ModOp::Sentinel);
+                let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
+                self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
             }
             _ => {}
         }
@@ -305,16 +311,16 @@ impl Table {
         if occupation > occu_limit {
             // resize
             debug!("Resizing");
-            let old_chunk_ins = unsafe { Chunk::from_ptr(old_chunk_ptr) };
+            let old_chunk_ins = unsafe { Chunk::borrow(old_chunk_ptr) };
             let new_cap = old_chunk_ins.capacity << 1;
             let new_chunk_ptr = Chunk::alloc_chunk(new_cap);
             if self.new_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, Relaxed) != old_chunk_ptr {
                 // other thread have allocated new chunk and wins the competition, exit
-                unsafe { Chunk::dealloc_chunk(new_chunk_ptr); }
+                unsafe { Chunk::mark_garbage(new_chunk_ptr); }
                 return true;
             }
             self.occu_limit.store(occupation_limit(new_cap), Relaxed);
-            let new_chunk_ins = unsafe { Chunk::from_ptr(new_chunk_ptr) };
+            let new_chunk_ins = unsafe { Chunk::borrow(new_chunk_ptr) };
             let new_base = new_chunk_ins.base;
             let mut old_address = old_chunk_ins.base as usize;
             let boundary = old_address + chunk_size_of(old_chunk_ins.capacity);
@@ -333,7 +339,7 @@ impl Table {
                             debug!("Moving key: {}, value: {}", key, v);
                             let primed_val = value.raw | self.inv_bit_mask;
                             let new_chunk_insertion = self.modify_entry(
-                                &new_chunk_ins,
+                                &*new_chunk_ins,
                                 key,
                                 ModOp::AttemptInsert(primed_val)
                             );
@@ -397,6 +403,7 @@ impl Table {
             if self.chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, Relaxed) != old_chunk_ptr {
                 panic!();
             }
+            unsafe { Chunk::mark_garbage(old_chunk_ptr); }
             debug!("{}", self.dump(new_base, new_cap));
             return true;
         }
@@ -450,16 +457,48 @@ impl Chunk {
     fn alloc_chunk(capacity: usize) -> *mut Self {
         let base = alloc_mem(chunk_size_of(capacity));
         let ptr = alloc_mem(mem::size_of::<Self>()) as *mut Self;
-        unsafe { ptr::write(ptr, Self { base, capacity }) };
+        unsafe { ptr::write(ptr, Self {
+            base, capacity,
+            is_garbage: AtomicBool::new(false),
+            referenced: AtomicUsize::new(0)
+        }) };
         ptr
     }
-    unsafe fn from_ptr(ptr: *mut Chunk) -> Self {
-        *&*ptr
+    unsafe fn borrow(ptr: *mut Chunk) -> ChunkRef {
+        let chunk = &*ptr;
+        chunk.referenced.fetch_add(1, Relaxed);
+        ChunkRef {
+            chunk: ptr
+        }
     }
-    unsafe fn dealloc_chunk(ptr: *mut Chunk) {
-        let chunk = Self::from_ptr(ptr);
-        dealloc_mem(ptr as usize, mem::size_of::<Self>());
-        dealloc_mem(chunk.base, chunk_size_of(chunk.capacity));
+    unsafe fn mark_garbage(ptr: *mut Chunk) {
+        // Caller promise this chunk will not be reachable from the outside except snapshot in threads
+        let chunk = &*ptr;
+        chunk.is_garbage.store(true, Relaxed);
+        Self::check_gc(ptr);
+    }
+    unsafe fn check_gc(ptr: *mut Chunk) {
+        let chunk = &*ptr;
+        if chunk.is_garbage.load(Relaxed) && chunk.referenced.load(Relaxed) == 0 {
+            dealloc_mem(ptr as usize, mem::size_of::<Self>());
+            dealloc_mem(chunk.base, chunk_size_of(chunk.capacity));
+        }
+    }
+}
+
+impl Drop for ChunkRef {
+    fn drop(&mut self) {
+        let chunk = unsafe { &*self.chunk };
+        chunk.referenced.fetch_sub(1, Relaxed);
+        unsafe { Chunk::check_gc(self.chunk) }
+    }
+}
+
+impl Deref for ChunkRef {
+    type Target = Chunk;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { &*self.chunk }
     }
 }
 
