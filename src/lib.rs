@@ -588,3 +588,18 @@ pub trait Attachment {
     fn erase(&self, index: usize, key: usize, value: usize);
     fn mov(&self, index: usize, key: usize, value: usize, dest: &Self, dest_index: usize);
 }
+
+pub struct Word;
+
+// the attachment basically do nothing and sized zero
+impl Attachment for Word {
+    fn new(cap: usize) -> Self { Self }
+
+    fn set(&self, index: usize, key: usize, value: usize) {}
+
+    fn erase(&self, index: usize, key: usize, value: usize) {}
+
+    fn mov(&self, index: usize, key: usize, value: usize, dest: &Self, dest_index: usize) {}
+}
+
+pub type WordTable = Table<Word>;
