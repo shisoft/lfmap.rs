@@ -623,7 +623,7 @@ pub trait Attachment<V> {
 
 pub struct WordAttachment;
 
-// the attachment basically do nothing and sized zero
+// this attachment basically do nothing and sized zero
 impl Attachment <()> for WordAttachment {
     fn new(cap: usize) -> Self { Self }
 
@@ -690,3 +690,57 @@ impl <T> ObjectAttachment <T> {
     }
 }
 
+pub trait Map<K, V> {
+    fn with_capacity(cap: usize) -> Self;
+    fn get(&self, key: K) -> Option<V>;
+    fn insert(&self, key: K, value: V)-> Option<()> ;
+    fn remove(&self, key: K)-> Option<()> ;
+}
+
+pub struct ObjectMap<V: Copy> {
+    table: Table<V, ObjectAttachment<V>>,
+}
+
+impl <V: Copy> Map<usize, V> for ObjectMap<V> {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: Table::with_capacity(cap)
+        }
+    }
+
+    fn get(&self, key: usize) -> Option<V> {
+        self.table.get(key).map(|v| v.1)
+    }
+
+    fn insert(&self, key: usize, value: V) -> Option<()> {
+        self.table.insert(key, !0, value).map(|_| ())
+    }
+
+    fn remove(&self, key: usize) -> Option<()> {
+        self.table.remove(key).map(|_| ())
+    }
+}
+
+pub struct WordMap{
+    table: WordTable
+}
+
+impl Map<usize, usize> for WordMap {
+    fn with_capacity(cap: usize) -> Self {
+        Self {
+            table: Table::with_capacity(cap)
+        }
+    }
+
+    fn get(&self, key: usize) -> Option<usize> {
+        self.table.get(key).map(|v| v.0)
+    }
+
+    fn insert(&self, key: usize, value: usize) -> Option<()> {
+        self.table.insert(key, value, ()).map(|_| ())
+    }
+
+    fn remove(&self, key: usize) -> Option<()> {
+        self.table.remove(key,).map(|_| ())
+    }
+}
