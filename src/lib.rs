@@ -42,7 +42,8 @@ enum ModResult {
     Fail(usize),
     Sentinel,
     NotFound,
-    Done(usize) // address of placement
+    Done(usize), // address of placement
+    TableFull
 }
 
 #[derive(Debug)]
@@ -120,7 +121,7 @@ impl Table {
             let copying = new_chunk_ptr != old_chunk_ptr;
             if !copying && self.check_resize(old_chunk_ptr) {
                 debug!("Resized, retry insertion key: {}, value {}", key, value);
-                return self.insert(key, value)
+                return Err(self.insert(key, value));
             }
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
@@ -131,14 +132,18 @@ impl Table {
                 ModResult::Replaced(v) | ModResult::Fail(v) => {
                     result = Some(v)
                 }
+                ModResult::TableFull => {
+                    return Err(self.insert(key, value));
+                }
                 _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
             };
             if copying {
+                debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
                 fence(Acquire);
                 self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
                 fence(Release);
             }
-            result
+            Ok(result)
         });
         self.occupation.fetch_add(1, Relaxed);
         result
@@ -153,23 +158,29 @@ impl Table {
             let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
             match res {
                 ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
+                    debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
+                    fence(Acquire);
                     self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
+                    fence(Release);
                 }
+                ModResult::TableFull => panic!("need to handle TableFull by remove"),
                 _ => {}
             }
-            match res {
+            Ok(match res {
                 ModResult::Replaced(v) => Some(v),
                 _ => None
-            }
+            })
         })
     }
 
-    fn ensure_write_new<R, F>(&self, f: F) -> R where F: Fn(*mut Chunk) -> R {
+    fn ensure_write_new<R, F>(&self, f: F) -> R where F: Fn(*mut Chunk) -> Result<R, R> {
         loop {
             let new_chunk_ptr = self.new_chunk.load(Relaxed);
             let f_res = f(new_chunk_ptr);
-            if self.new_chunk.load(Relaxed) == new_chunk_ptr {
-                return f_res
+            match f_res {
+                Ok(r) if self.new_chunk.load(Relaxed) == new_chunk_ptr => return r,
+                Err(r) => return r,
+                _ => { debug_assert!(true, "Invalid write new") }
             }
         }
     }
@@ -287,13 +298,8 @@ impl Table {
             count += 1;
         }
         match op {
-            ModOp::Insert(v) =>
-                panic!("Table is full, cannot insert {}-{} into. Capacity: {}, Count: {}, {}",
-                       key, v, chunk.capacity, count, self.dump(chunk.base, chunk.capacity)),
-            ModOp::AttemptInsert(v) =>
-                panic!("Table is full, cannot attempt insert {}-{} into. Capacity {}, Count: {}, {}",
-                       key, v, chunk.capacity, count, self.dump(chunk.base, chunk.capacity)),
-            _ => return ModResult::NotFound
+            ModOp::Insert(v) | ModOp::AttemptInsert(v)  => ModResult::TableFull,
+            _ => ModResult::NotFound
         }
     }
 
@@ -375,6 +381,7 @@ impl Table {
                                 ModResult::NotFound => {
                                     unreachable!()
                                 }
+                                ModResult::TableFull => panic!()
                             };
                             if let Some(entry_addr) = inserted_addr {
                                 fence(Acquire);
@@ -504,7 +511,10 @@ impl Chunk {
     }
     unsafe fn check_gc(ptr: *mut Chunk) {
         let chunk = &*ptr;
-        if chunk.is_garbage.load(Relaxed) && chunk.referenced.load(Relaxed) == 0 {
+        if  chunk.referenced.load(Relaxed) == 0 &&
+            // CAS is_garbage and assume true to avoid double free by other threads
+            chunk.is_garbage.compare_and_swap(true, false, Relaxed) == true
+        {
             dealloc_mem(ptr as usize, mem::size_of::<Self>());
             dealloc_mem(chunk.base, chunk_size_of(chunk.capacity));
         }
