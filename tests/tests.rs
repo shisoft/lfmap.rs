@@ -5,7 +5,7 @@ use std::thread;
 
 #[test]
 fn will_not_overflow() {
-    env_logger::init();
+    env_logger::try_init();
     let table = Table::with_capacity(16);
     for i in 50..60 {
         assert_eq!(table.insert(i, i), None);
@@ -17,7 +17,7 @@ fn will_not_overflow() {
 
 #[test]
 fn resize () {
-    env_logger::init();
+    env_logger::try_init();
     let map = Table::with_capacity(16);
     for i in 5..2048 {
         map.insert(i, i * 2);
@@ -32,7 +32,7 @@ fn resize () {
 
 #[test]
 fn parallel_no_resize() {
-    env_logger::init();
+    env_logger::try_init();
     let map = Arc::new(Table::with_capacity(65536));
     let mut threads = vec![];
     for i in 5..99 {
