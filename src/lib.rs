@@ -47,6 +47,11 @@ enum ModResult {
     TableFull
 }
 
+struct ModOutput  {
+    result: ModResult,
+    index: usize
+}
+
 #[derive(Debug)]
 enum ModOp {
     Insert(usize),
@@ -78,7 +83,7 @@ pub struct Table<V, A: Attachment<V>> {
     inv_bit_mask: usize  // 1000000..
 }
 
-impl <V, A: Attachment<V>> Table <V, A> {
+impl <V: Copy, A: Attachment<V>> Table <V, A> {
     pub fn with_capacity(cap: usize) -> Self {
         if !is_power_of_2(cap) {
             panic!("capacity is not power of 2");
@@ -99,12 +104,14 @@ impl <V, A: Attachment<V>> Table <V, A> {
         Self::with_capacity(64)
     }
 
-    pub fn get(&self, key: usize) -> Option<usize> {
+    pub fn get(&self, key: usize) -> Option<(usize, V)> {
         let mut chunk = unsafe { Chunk::borrow(self.old_chunk.load(SeqCst)) };
         loop {
-            let val = self.get_from_chunk(&*chunk, key);
+            let (val, idx) = self.get_from_chunk(&*chunk, key);
             match val.parsed {
-                ParsedValue::Prime(val) | ParsedValue::Val(val) => return Some(val),
+                ParsedValue::Prime(val) | ParsedValue::Val(val) => {
+                    return Some((val, chunk.attachment.get(idx, key)))
+                },
                 ParsedValue::Sentinel => {
                     let old_chunk_base = chunk.base;
                     chunk = unsafe { Chunk::borrow(self.new_chunk.load(SeqCst)) };
@@ -115,20 +122,21 @@ impl <V, A: Attachment<V>> Table <V, A> {
         }
     }
 
-    pub fn insert(&self, key: usize, value: usize) -> Option<usize> {
+    pub fn insert(&self, key: usize, value: usize, attached_val: V) -> Option<(usize)> {
         debug!("Inserting key: {}, value: {}", key, value);
         let result = self.ensure_write_new(|new_chunk_ptr| {
             let old_chunk_ptr = self.old_chunk.load(Relaxed);
             let copying = new_chunk_ptr != old_chunk_ptr;
             if !copying && self.check_resize(old_chunk_ptr) {
                 debug!("Resized, retry insertion key: {}, value {}", key, value);
-                return Err(self.insert(key, value));
+                return Err(self.insert(key, value, attached_val));
             }
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
             let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value));
+            let insertion_index = value_insertion.index;
             let mut result = None;
-            match value_insertion {
+            match value_insertion.result {
                 ModResult::Done(_) => {},
                 ModResult::Replaced(v) | ModResult::Fail(v) => {
                     result = Some(v)
@@ -140,8 +148,9 @@ impl <V, A: Attachment<V>> Table <V, A> {
                     debug!("Insert new and see sentinel, abort");
                     return Ok(None);
                 }
-                _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
-            };
+                _ => unreachable!("{:?}, copying: {}", value_insertion.result, copying)
+            }
+            new_chunk.attachment.set(insertion_index, key, attached_val);
             if copying {
                 debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
                 fence(Acquire);
@@ -161,17 +170,18 @@ impl <V, A: Attachment<V>> Table <V, A> {
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
             let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
-            match res {
+            match res.result {
                 ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
                     debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
                     fence(Acquire);
                     self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
                     fence(Release);
+                    new_chunk.attachment.erase(res.index, key);
                 }
                 ModResult::TableFull => panic!("need to handle TableFull by remove"),
                 _ => {}
             }
-            Ok(match res {
+            Ok(match res.result {
                 ModResult::Replaced(v) => Some(v),
                 _ => None
             })
@@ -190,7 +200,7 @@ impl <V, A: Attachment<V>> Table <V, A> {
         }
     }
 
-    fn get_from_chunk(&self, chunk: &Chunk<V, A>, key: usize) -> Value {
+    fn get_from_chunk(&self, chunk: &Chunk<V, A>, key: usize) -> (Value, usize) {
         let mut idx = key;
         let entry_size = mem::size_of::<EntryTemplate>();
         let cap = chunk.capacity;
@@ -204,21 +214,21 @@ impl <V, A: Attachment<V>> Table <V, A> {
                 let val_res = self.get_value(addr);
                 match val_res.parsed {
                     ParsedValue::Empty => {},
-                    _ => return val_res
+                    _ => return (val_res, idx)
                 }
             }
             if k == EMPTY_KEY {
-                return Value::new(0, self);
+                return (Value::new(0, self), 0);
             }
             idx += 1; // reprobe
             counter += 1;
         }
 
         // not found
-        return Value::new(0, self);
+        return (Value::new(0, self), 0);
     }
 
-    fn modify_entry(&self, chunk: &Chunk<V, A>, key: usize, op: ModOp) -> ModResult {
+    fn modify_entry(&self, chunk: &Chunk<V, A>, key: usize, op: ModOp) -> ModOutput {
         let cap = chunk.capacity;
         let base = chunk.base;
         let mut idx = key;
@@ -237,14 +247,14 @@ impl <V, A: Attachment<V>> Table <V, A> {
                         match op {
                             ModOp::Sentinel => {
                                 self.set_sentinel(addr);
-                                return ModResult::Done(addr);
+                                return ModOutput::new(ModResult::Done(addr), idx);
                             }
                             ModOp::Empty | ModOp::Insert(_) => {
                                 if !self.set_tombstone(addr, val.raw) {
                                     // this insertion have conflict with others
                                     // other thread changed the value
                                     // should fail (?)
-                                    return ModResult::Fail(*v);
+                                    return ModOutput::new(ModResult::Fail(*v), idx)
                                 } else {
                                     // we have put tombstone on the value
                                     replaced = Some(*v);
@@ -252,12 +262,12 @@ impl <V, A: Attachment<V>> Table <V, A> {
                             }
                             ModOp::AttemptInsert(_) => {
                                 // Attempting insert existed entry, skip
-                                return ModResult::Fail(*v);
+                                return ModOutput::new(ModResult::Fail(*v), idx);
                             }
                         }
                         match op {
                             ModOp::Empty => {
-                                return ModResult::Replaced(*v)
+                                return ModOutput::new(ModResult::Replaced(*v), idx)
                             }
                             _ => {}
                         }
@@ -265,7 +275,7 @@ impl <V, A: Attachment<V>> Table <V, A> {
                     ParsedValue::Empty => {
                         // found the key with empty value, shall do nothing and continue probing
                     },
-                    ParsedValue::Sentinel => return ModResult::Sentinel // should not reachable for insertion happens on new list
+                    ParsedValue::Sentinel => return ModOutput::new(ModResult::Sentinel, idx) // should not reachable for insertion happens on new list
                 }
 
             } else if k == EMPTY_KEY {
@@ -291,20 +301,20 @@ impl <V, A: Attachment<V>> Table <V, A> {
                         put_in_empty(val)
                     },
                     ModOp::Sentinel => put_in_empty(SENTINEL_VALUE),
-                    ModOp::Empty => return ModResult::Fail(0),
+                    ModOp::Empty => return ModOutput::new(ModResult::Fail(0), idx),
                     _ => unreachable!("{:?}", op)
                 };
                 match &mod_res {
                     ModResult::Fail(_) => {},
-                    _ => return mod_res
+                    _ => return ModOutput::new(mod_res, idx)
                 }
             }
             idx += 1; // reprobe
             count += 1;
         }
         match op {
-            ModOp::Insert(v) | ModOp::AttemptInsert(v)  => ModResult::TableFull,
-            _ => ModResult::NotFound
+            ModOp::Insert(v) | ModOp::AttemptInsert(v)  => ModOutput::new(ModResult::TableFull, 0),
+            _ => ModOutput::new(ModResult::NotFound, 0)
         }
     }
 
@@ -357,6 +367,7 @@ impl <V, A: Attachment<V>> Table <V, A> {
             let mut old_address = old_chunk_ins.base as usize;
             let boundary = old_address + chunk_size_of(old_cap);
             let mut effective_copy = 0;
+            let mut idx = 0;
             while old_address < boundary  {
                 // iterate the old chunk to extract entries that is NOT empty
                 let key = self.get_key(old_address);
@@ -375,7 +386,13 @@ impl <V, A: Attachment<V>> Table <V, A> {
                                 key,
                                 ModOp::AttemptInsert(primed_val)
                             );
-                            let inserted_addr = match new_chunk_insertion {
+                            new_chunk_ins.attachment.mov(
+                                idx,
+                                key,
+                                &old_chunk_ins.attachment,
+                                new_chunk_insertion.index
+                            );
+                            let inserted_addr = match new_chunk_insertion.result {
                                 ModResult::Done(addr) => Some(addr), // continue procedure
                                 ModResult::Fail(v) => None,
                                 ModResult::Replaced(_) => {
@@ -424,6 +441,7 @@ impl <V, A: Attachment<V>> Table <V, A> {
                     }
                 }
                 old_address += entry_size();
+                idx += 1;
             }
             // resize finished, make changes on the numbers
             new_chunk_ins.occupation.fetch_add(effective_copy, Relaxed);
@@ -526,6 +544,14 @@ impl <V, A: Attachment<V>> Chunk <V, A> {
     }
 }
 
+impl ModOutput {
+    pub fn new(res: ModResult, idx: usize) -> Self {
+        Self {
+            result: res, index: idx
+        }
+    }
+}
+
 impl <V, A: Attachment<V>>  Drop for ChunkRef<V, A> {
     fn drop(&mut self) {
         if self.chunk as usize == 0 { return }
@@ -587,9 +613,10 @@ fn dealloc_mem(ptr: usize, size: usize) {
 
 pub trait Attachment<V> {
     fn new(cap: usize) -> Self;
-    fn set(&self, index: usize, key: usize, value: usize, att_value: V);
-    fn erase(&self, index: usize, key: usize, value: usize);
-    fn mov(&self, index: usize, key: usize, value: usize, dest: &Self, dest_index: usize);
+    fn get(&self, index: usize, key: usize) -> V;
+    fn set(&self, index: usize, key: usize, att_value: V);
+    fn erase(&self, index: usize, key: usize);
+    fn mov(&self, index: usize, key: usize, dest: &Self, dest_index: usize);
 }
 
 pub struct WordAttachment;
@@ -598,11 +625,39 @@ pub struct WordAttachment;
 impl Attachment <()> for WordAttachment {
     fn new(cap: usize) -> Self { Self }
 
-    fn set(&self, index: usize, key: usize, value: usize, att_value: ()) {}
+    fn get(&self, index: usize, key: usize) -> () {}
 
-    fn erase(&self, index: usize, key: usize, value: usize) {}
+    fn set(&self, index: usize, key: usize, att_value: ()) {}
 
-    fn mov(&self, index: usize, key: usize, value: usize, dest: &Self, dest_index: usize) {}
+    fn erase(&self, index: usize, key: usize) {}
+
+    fn mov(&self, index: usize, key: usize, dest: &Self, dest_index: usize) {}
 }
 
 pub type WordTable = Table<(), WordAttachment>;
+
+pub struct ObjectAttachment<T> {
+    shadow: PhantomData<T>
+}
+
+impl  <T: Copy> Attachment<T> for ObjectAttachment<T> {
+    fn new(cap: usize) -> Self {
+        unimplemented!()
+    }
+
+    fn get(&self, index: usize, key: usize) -> T {
+        unimplemented!()
+    }
+
+    fn set(&self, index: usize, key: usize, att_value: T) {
+        unimplemented!()
+    }
+
+    fn erase(&self, index: usize, key: usize) {
+       // will not erase
+    }
+
+    fn mov(&self, index: usize, key: usize, dest: &Self, dest_index: usize) {
+        unimplemented!()
+    }
+}

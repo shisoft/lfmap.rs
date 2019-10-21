@@ -8,10 +8,10 @@ fn will_not_overflow() {
     env_logger::try_init();
     let table = WordTable::with_capacity(16);
     for i in 50..60 {
-        assert_eq!(table.insert(i, i), None);
+        assert_eq!(table.insert(i, i, ()), None);
     }
     for i in 50..60 {
-        assert_eq!(table.get(i), Some(i));
+        assert_eq!(table.get(i).unwrap().0, i);
     }
 }
 
@@ -20,11 +20,11 @@ fn resize () {
     env_logger::try_init();
     let map = WordTable::with_capacity(16);
     for i in 5..2048 {
-        map.insert(i, i * 2);
+        map.insert(i, i * 2, ());
     }
     for i in 5..2048 {
         match map.get(i) {
-            Some(r) => assert_eq!(r, i * 2),
+            Some((r, _)) => assert_eq!(r, i * 2),
             None => panic!("{}", i)
         }
     }
@@ -36,14 +36,14 @@ fn parallel_no_resize() {
     let map = Arc::new(WordTable::with_capacity(65536));
     let mut threads = vec![];
     for i in 5..99 {
-        map.insert(i, i * 10);
+        map.insert(i, i * 10, ());
     }
     for i in 100..900 {
         let map = map.clone();
         threads.push(
             thread::spawn(move || {
                 for j in 5..60 {
-                    map.insert(i * 100 + j, i * j);
+                    map.insert(i * 100 + j, i * j, ());
                 }
             })
         );
@@ -58,7 +58,7 @@ fn parallel_no_resize() {
     }
     for i in 100..900 {
         for j in 5..60 {
-            assert_eq!(map.get(i * 100 + j).unwrap(), i * j)
+            assert_eq!(map.get(i * 100 + j).unwrap().0, i * j)
         }
     }
     for i in 5..9 {
@@ -77,7 +77,7 @@ fn parallel_with_resize() {
         threads.push(
             thread::spawn(move || {
                 for j in 5..1000 {
-                    map.insert(i + j * 100, i * j);
+                    map.insert(i + j * 100, i * j, ());
                 }
 
             })
@@ -90,7 +90,7 @@ fn parallel_with_resize() {
         for j in 5..1000 {
             let k = i + j * 100;
             match map.get(k) {
-                Some(v) => assert_eq!(v, i * j),
+                Some((v, _)) => assert_eq!(v, i * j),
                 None => {
                     panic!("Value should not be None for key: {}", k)
                 }
@@ -103,7 +103,7 @@ fn parallel_with_resize() {
     fn parallel_hybird() {
         let map = Arc::new(WordTable::with_capacity(32));
         for i in 5..128 {
-            map.insert(i, i * 10);
+            map.insert(i, i * 10, ());
         }
         let mut threads = vec![];
         for i in 256..265 {
@@ -111,7 +111,7 @@ fn parallel_with_resize() {
             threads.push(
                 thread::spawn(move || {
                     for j in 5..60 {
-                        map.insert(i * 10 + j , 10);
+                        map.insert(i * 10 + j , 10, ());
                     }
 
                 })
@@ -132,7 +132,7 @@ fn parallel_with_resize() {
         }
         for i in 256..265 {
             for j in 5..60 {
-                assert_eq!(map.get(i * 10 + j).unwrap(), 10)
+                assert_eq!(map.get(i * 10 + j).unwrap().0, 10)
             }
         }
     }
