@@ -592,10 +592,10 @@ pub trait Attachment<V> {
     fn mov(&self, index: usize, key: usize, value: usize, dest: &Self, dest_index: usize);
 }
 
-pub struct Word;
+pub struct WordAttachment;
 
 // the attachment basically do nothing and sized zero
-impl Attachment <()> for Word {
+impl Attachment <()> for WordAttachment {
     fn new(cap: usize) -> Self { Self }
 
     fn set(&self, index: usize, key: usize, value: usize, att_value: ()) {}
@@ -605,4 +605,4 @@ impl Attachment <()> for Word {
     fn mov(&self, index: usize, key: usize, value: usize, dest: &Self, dest_index: usize) {}
 }
 
-pub type WordTable = Table<(), Word>;
+pub type WordTable = Table<(), WordAttachment>;
