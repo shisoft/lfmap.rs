@@ -10,7 +10,7 @@ use alloc::alloc::Global;
 use core::alloc::{Alloc, Layout};
 use core::{mem, ptr, intrinsics};
 use core::sync::atomic::{AtomicUsize, AtomicPtr, fence, AtomicBool};
-use core::sync::atomic::Ordering::{Relaxed, Acquire, Release};
+use core::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
 use core::iter::Copied;
 use core::cmp::Ordering;
 use core::ptr::NonNull;
@@ -57,8 +57,11 @@ enum ModOp {
 pub struct Chunk {
     capacity: usize,
     base: usize,
+    // floating-point multiplication is slow, cache this value and recompute every time when resize
+    occu_limit: usize,
+    occupation: AtomicUsize,
     referenced: AtomicUsize,
-    is_garbage: AtomicBool
+    is_garbage: AtomicBool,
 }
 
 pub struct ChunkRef {
@@ -68,9 +71,6 @@ pub struct ChunkRef {
 pub struct Table {
     chunk: AtomicPtr<Chunk>,
     new_chunk: AtomicPtr<Chunk>,
-    occupation: AtomicUsize,
-    // floating-point multiplication is slow, cache this value and recompute every time when resize
-    occu_limit: AtomicUsize,
     val_bit_mask: usize, // 0111111..
     inv_bit_mask: usize  // 1000000..
 }
@@ -87,8 +87,6 @@ impl Table {
         Self {
             chunk: AtomicPtr::new(chunk),
             new_chunk: AtomicPtr::new(chunk),
-            occupation: AtomicUsize::new(0),
-            occu_limit: AtomicUsize::new(occupation_limit(cap)),
             val_bit_mask,
             inv_bit_mask: !val_bit_mask
         }
@@ -99,14 +97,14 @@ impl Table {
     }
 
     pub fn get(&self, key: usize) -> Option<usize> {
-        let mut chunk = unsafe { Chunk::borrow(self.chunk.load(Relaxed)) };
+        let mut chunk = unsafe { Chunk::borrow(self.chunk.load(SeqCst)) };
         loop {
             let val = self.get_from_chunk(&*chunk, key);
             match val.parsed {
                 ParsedValue::Prime(val) | ParsedValue::Val(val) => return Some(val),
                 ParsedValue::Sentinel => {
                     let old_chunk_base = chunk.base;
-                    chunk = unsafe { Chunk::borrow(self.new_chunk.load(Relaxed)) };
+                    chunk = unsafe { Chunk::borrow(self.new_chunk.load(SeqCst)) };
                     debug_assert_ne!(old_chunk_base, chunk.base);
                 }
                 ParsedValue::Empty => return None
@@ -133,7 +131,7 @@ impl Table {
                     result = Some(v)
                 }
                 ModResult::TableFull => {
-                    return Err(self.insert(key, value));
+                    panic!("Insertion is too fast");
                 }
                 _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
             };
@@ -143,9 +141,9 @@ impl Table {
                 self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
                 fence(Release);
             }
+            new_chunk.occupation.fetch_add(1, Relaxed);
             Ok(result)
         });
-        self.occupation.fetch_add(1, Relaxed);
         result
     }
 
@@ -175,10 +173,10 @@ impl Table {
 
     fn ensure_write_new<R, F>(&self, f: F) -> R where F: Fn(*mut Chunk) -> Result<R, R> {
         loop {
-            let new_chunk_ptr = self.new_chunk.load(Relaxed);
+            let new_chunk_ptr = self.new_chunk.load(SeqCst);
             let f_res = f(new_chunk_ptr);
             match f_res {
-                Ok(r) if self.new_chunk.load(Relaxed) == new_chunk_ptr => return r,
+                Ok(r) if self.new_chunk.load(SeqCst) == new_chunk_ptr => return r,
                 Err(r) => return r,
                 _ => { debug_assert!(true, "Invalid write new") }
             }
@@ -332,24 +330,25 @@ impl Table {
 
     #[inline(always)]
     fn check_resize(&self, old_chunk_ptr: *mut Chunk) -> bool {
-        let occupation = self.occupation.load(Relaxed);
-        let occu_limit = self.occu_limit.load(Relaxed);
+        let old_chunk_ins = unsafe { Chunk::borrow(old_chunk_ptr) };
+        let occupation = old_chunk_ins.occupation.load(Relaxed);
+        let occu_limit = old_chunk_ins.occu_limit;
         if occupation > occu_limit {
             // resize
             debug!("Resizing");
-            let old_chunk_ins = unsafe { Chunk::borrow(old_chunk_ptr) };
-            let new_cap = old_chunk_ins.capacity << 1;
+            let old_cap = old_chunk_ins.capacity;
+            let mult = if old_cap < 2048 { 4 } else { 1 };
+            let new_cap = old_cap << mult;
             let new_chunk_ptr = Chunk::alloc_chunk(new_cap);
-            if self.new_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, Relaxed) != old_chunk_ptr {
+            if self.new_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
                 // other thread have allocated new chunk and wins the competition, exit
                 unsafe { Chunk::mark_garbage(new_chunk_ptr); }
                 return true;
             }
-            self.occu_limit.store(occupation_limit(new_cap), Relaxed);
             let new_chunk_ins = unsafe { Chunk::borrow(new_chunk_ptr) };
             let new_base = new_chunk_ins.base;
             let mut old_address = old_chunk_ins.base as usize;
-            let boundary = old_address + chunk_size_of(old_chunk_ins.capacity);
+            let boundary = old_address + chunk_size_of(old_cap);
             let mut effective_copy = 0;
             while old_address < boundary  {
                 // iterate the old chunk to extract entries that is NOT empty
@@ -420,12 +419,7 @@ impl Table {
                 old_address += entry_size();
             }
             // resize finished, make changes on the numbers
-            let changes = occupation as isize - effective_copy;
-            if changes > 0 {
-                self.occupation.fetch_sub(changes as usize, Relaxed);
-            } else {
-                self.occupation.fetch_add((-changes) as usize, Relaxed);
-            }
+            new_chunk_ins.occupation.fetch_add(effective_copy, Relaxed);
             debug_assert_ne!(old_chunk_ptr as usize, new_base);
             if self.chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, Relaxed) != old_chunk_ptr {
                 panic!();
@@ -486,6 +480,8 @@ impl Chunk {
         let ptr = alloc_mem(mem::size_of::<Self>()) as *mut Self;
         unsafe { ptr::write(ptr, Self {
             base, capacity,
+            occupation: AtomicUsize::new(0),
+            occu_limit: occupation_limit(capacity),
             is_garbage: AtomicBool::new(false),
             referenced: AtomicUsize::new(0)
         }) };
@@ -552,7 +548,7 @@ fn is_power_of_2(num: usize) -> bool {
 
 #[inline(always)]
 fn occupation_limit(cap: usize) -> usize {
-    (cap as f64 * 0.8f64) as usize
+    (cap as f64 * 0.7f64) as usize
 }
 
 #[inline(always)]
