@@ -123,6 +123,7 @@ impl Table {
             return self.insert(key, value)
         }
         let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
         let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value));
         let mut result = None;
         match value_insertion {
@@ -134,7 +135,6 @@ impl Table {
         };
         if copying {
             fence(Acquire);
-            let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
             self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
             fence(Release);
         }
@@ -147,10 +147,10 @@ impl Table {
         let old_chunk_ptr = self.chunk.load(Relaxed);
         let copying = new_chunk_ptr != old_chunk_ptr;
         let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
         let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
         match res {
             ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
-                let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
                 self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
             }
             _ => {}
@@ -478,6 +478,11 @@ impl Chunk {
             chunk: ptr
         }
     }
+
+    unsafe fn borrow_if_cond(ptr: *mut Chunk, cond: bool) -> ChunkRef {
+        if cond { unsafe { Chunk::borrow(ptr) } } else { ChunkRef::null_ref() }
+    }
+
     unsafe fn mark_garbage(ptr: *mut Chunk) {
         // Caller promise this chunk will not be reachable from the outside except snapshot in threads
         let chunk = &*ptr;
@@ -495,6 +500,7 @@ impl Chunk {
 
 impl Drop for ChunkRef {
     fn drop(&mut self) {
+        if self.chunk as usize == 0 { return }
         let chunk = unsafe { &*self.chunk };
         chunk.referenced.fetch_sub(1, Relaxed);
         unsafe { Chunk::check_gc(self.chunk) }
@@ -507,6 +513,10 @@ impl Deref for ChunkRef {
     fn deref(&self) -> &Self::Target {
         unsafe { &*self.chunk }
     }
+}
+
+impl ChunkRef {
+    fn null_ref() -> Self { Self { chunk: 0 as *mut Chunk } }
 }
 
 fn is_power_of_2(num: usize) -> bool {

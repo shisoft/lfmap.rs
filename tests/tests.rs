@@ -99,6 +99,44 @@ fn parallel_with_resize() {
     }
 }
 
+    #[test]
+    fn parallel_hybird() {
+        let map = Arc::new(Table::with_capacity(32));
+        for i in 5..128 {
+            map.insert(i, i * 10);
+        }
+        let mut threads = vec![];
+        for i in 256..265 {
+            let map = map.clone();
+            threads.push(
+                thread::spawn(move || {
+                    for j in 5..60 {
+                        map.insert(i * 10 + j , 10);
+                    }
+
+                })
+            );
+        }
+        for i in 5..8 {
+            let map = map.clone();
+            threads.push(
+                thread::spawn(move || {
+                    for j in 5..8 {
+                        map.remove(i * j);
+                    }
+                })
+            );
+        }
+        for thread in threads {
+            let _ = thread.join();
+        }
+        for i in 256..265 {
+            for j in 5..60 {
+                assert_eq!(map.get(i * 10 + j).unwrap(), 10)
+            }
+        }
+    }
+
 
 //#![feature(core_intrinsics)]
 //#![feature(test)]
