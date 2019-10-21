@@ -1,8 +1,10 @@
 extern crate lfmap;
 use lfmap::*;
+use std::sync::Arc;
+use std::thread;
 
 #[test]
-pub fn will_not_overflow() {
+fn will_not_overflow() {
     env_logger::init();
     let table = Table::with_capacity(16);
     for i in 50..60 {
@@ -11,13 +13,61 @@ pub fn will_not_overflow() {
     for i in 50..60 {
         assert_eq!(table.get(i), Some(i));
     }
-    for i in 50..55 {
-        assert_eq!(table.insert(i, 10), Some(i));
+}
+
+#[test]
+fn resize () {
+    env_logger::init();
+    let map = Table::with_capacity(16);
+    for i in 5..2048 {
+        map.insert(i, i * 2);
     }
-    for i in 50..55 {
-        assert_eq!(table.get(i), Some(10), "Check replace {}", i);
+    for i in 5..2048 {
+        match map.get(i) {
+            Some(r) => assert_eq!(r, i * 2),
+            None => panic!("{}", i)
+        }
     }
 }
+
+#[test]
+fn parallel_no_resize() {
+    env_logger::init();
+    let map = Arc::new(Table::with_capacity(65536));
+    let mut threads = vec![];
+    for i in 5..99 {
+        map.insert(i, i * 10);
+    }
+    for i in 100..900 {
+        let map = map.clone();
+        threads.push(
+            thread::spawn(move || {
+                for j in 5..60 {
+                    map.insert(i * 100 + j, i * j);
+                }
+            })
+        );
+    }
+    for i in 5..9 {
+        for j in 1..10 {
+            map.remove(i * j);
+        }
+    }
+    for thread in threads {
+        let _ = thread.join();
+    }
+    for i in 100..900 {
+        for j in 5..60 {
+            assert_eq!(map.get(i * 100 + j).unwrap(), i * j)
+        }
+    }
+    for i in 5..9 {
+        for j in 1..10 {
+            assert!(map.get(i * j).is_none())
+        }
+    }
+}
+
 
 //#![feature(core_intrinsics)]
 //#![feature(test)]

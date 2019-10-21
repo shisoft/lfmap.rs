@@ -45,6 +45,7 @@ enum ModResult {
     Done(usize) // address of placement
 }
 
+#[derive(Debug)]
 enum ModOp {
     Insert(usize),
     AttemptInsert(usize),
@@ -261,7 +262,8 @@ impl Table {
                         put_in_empty(val)
                     },
                     ModOp::Sentinel => put_in_empty(SENTINEL_VALUE),
-                    _ => unreachable!()
+                    ModOp::Empty => return ModResult::Fail(0),
+                    _ => unreachable!("{:?}", op)
                 };
                 match &mod_res {
                     ModResult::Fail(_) => {},
@@ -272,7 +274,12 @@ impl Table {
             count += 1;
         }
         match op {
-            ModOp::Insert(_) => panic!("Table is full, cannot insert into"),
+            ModOp::Insert(v) =>
+                panic!("Table is full, cannot insert {}-{} into. Capacity: {}, Count: {}, {}",
+                       key, v, chunk.capacity, count, self.dump(chunk.base, chunk.capacity)),
+            ModOp::AttemptInsert(v) =>
+                panic!("Table is full, cannot attempt insert {}-{} into. Capacity {}, Count: {}, {}",
+                       key, v, chunk.capacity, count, self.dump(chunk.base, chunk.capacity)),
             _ => return ModResult::NotFound
         }
     }
@@ -527,7 +534,8 @@ fn chunk_size_of(cap: usize) -> usize {
 fn alloc_mem(size: usize) -> usize {
     let align = mem::align_of::<EntryTemplate>();
     let layout = Layout::from_size_align(size, align).unwrap();
-    unsafe { Global.alloc(layout) }.unwrap().as_ptr() as usize
+    // must be all zeroed
+    unsafe { Global.alloc_zeroed(layout) }.unwrap().as_ptr() as usize
 }
 
 fn dealloc_mem(ptr: usize, size: usize) {
