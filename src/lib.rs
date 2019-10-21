@@ -115,49 +115,62 @@ impl Table {
 
     pub fn insert(&self, key: usize, value: usize) -> Option<usize> {
         debug!("Inserting key: {}, value: {}", key, value);
-        let new_chunk_ptr = self.new_chunk.load(Relaxed);
-        let old_chunk_ptr = self.chunk.load(Relaxed);
-        let copying = new_chunk_ptr != old_chunk_ptr;
-        if !copying && self.check_resize(old_chunk_ptr) {
-            debug!("Resized, retry insertion key: {}, value {}", key, value);
-            return self.insert(key, value)
-        }
-        let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
-        let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
-        let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value));
-        let mut result = None;
-        match value_insertion {
-            ModResult::Done(_) => {},
-            ModResult::Replaced(v) | ModResult::Fail(v) => {
-                result = Some(v)
+        let result = self.ensure_write_new(|new_chunk_ptr| {
+            let old_chunk_ptr = self.chunk.load(Relaxed);
+            let copying = new_chunk_ptr != old_chunk_ptr;
+            if !copying && self.check_resize(old_chunk_ptr) {
+                debug!("Resized, retry insertion key: {}, value {}", key, value);
+                return self.insert(key, value)
             }
-            _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
-        };
-        if copying {
-            fence(Acquire);
-            self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
-            fence(Release);
-        }
+            let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+            let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
+            let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value));
+            let mut result = None;
+            match value_insertion {
+                ModResult::Done(_) => {},
+                ModResult::Replaced(v) | ModResult::Fail(v) => {
+                    result = Some(v)
+                }
+                _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
+            };
+            if copying {
+                fence(Acquire);
+                self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
+                fence(Release);
+            }
+            result
+        });
         self.occupation.fetch_add(1, Relaxed);
         result
     }
 
     pub fn remove(&self, key: usize) -> Option<usize> {
-        let new_chunk_ptr = self.new_chunk.load(Relaxed);
-        let old_chunk_ptr = self.chunk.load(Relaxed);
-        let copying = new_chunk_ptr != old_chunk_ptr;
-        let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
-        let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
-        let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
-        match res {
-            ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
-                self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
+        self.ensure_write_new(|new_chunk_ptr| {
+            let old_chunk_ptr = self.chunk.load(Relaxed);
+            let copying = new_chunk_ptr != old_chunk_ptr;
+            let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+            let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
+            let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
+            match res {
+                ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
+                    self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
+                }
+                _ => {}
             }
-            _ => {}
-        }
-        match res {
-            ModResult::Replaced(v) => Some(v),
-            _ => None
+            match res {
+                ModResult::Replaced(v) => Some(v),
+                _ => None
+            }
+        })
+    }
+
+    fn ensure_write_new<R, F>(&self, f: F) -> R where F: Fn(*mut Chunk) -> R {
+        loop {
+            let new_chunk_ptr = self.new_chunk.load(Relaxed);
+            let f_res = f(new_chunk_ptr);
+            if self.new_chunk.load(Relaxed) == new_chunk_ptr {
+                return f_res
+            }
         }
     }
 
@@ -511,6 +524,7 @@ impl Deref for ChunkRef {
     type Target = Chunk;
 
     fn deref(&self) -> &Self::Target {
+        debug_assert_ne!(self.chunk as usize, 0);
         unsafe { &*self.chunk }
     }
 }
