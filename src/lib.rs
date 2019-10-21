@@ -538,6 +538,7 @@ impl <V, A: Attachment<V>> Chunk <V, A> {
             // CAS is_garbage and assume true to avoid double free by other threads
             chunk.is_garbage.compare_and_swap(true, false, Relaxed) == true
         {
+            chunk.attachment.dealloc();
             dealloc_mem(ptr as usize, mem::size_of::<Self>());
             dealloc_mem(chunk.base, chunk_size_of(chunk.capacity));
         }
@@ -616,7 +617,8 @@ pub trait Attachment<V> {
     fn get(&self, index: usize, key: usize) -> V;
     fn set(&self, index: usize, key: usize, att_value: V);
     fn erase(&self, index: usize, key: usize);
-    fn mov(&self, index: usize, key: usize, dest: &Self, dest_index: usize);
+    fn mov(&self, index: usize, key: usize, src: &Self, src_index: usize);
+    fn dealloc(&self);
 }
 
 pub struct WordAttachment;
@@ -631,33 +633,60 @@ impl Attachment <()> for WordAttachment {
 
     fn erase(&self, index: usize, key: usize) {}
 
-    fn mov(&self, index: usize, key: usize, dest: &Self, dest_index: usize) {}
+    fn mov(&self, index: usize, key: usize, src: &Self, src_index: usize) {}
+
+    fn dealloc(&self) {}
 }
 
 pub type WordTable = Table<(), WordAttachment>;
 
 pub struct ObjectAttachment<T> {
+    obj_chunk: usize,
+    size: usize,
+    obj_size: usize,
     shadow: PhantomData<T>
 }
 
 impl  <T: Copy> Attachment<T> for ObjectAttachment<T> {
     fn new(cap: usize) -> Self {
-        unimplemented!()
+        let obj_size = mem::size_of::<T>();
+        let obj_chunk_size = cap * obj_size;
+        let addr = alloc_mem(obj_chunk_size);
+        Self {
+            obj_chunk: addr,
+            size: obj_chunk_size,
+            obj_size,
+            shadow: PhantomData
+        }
     }
 
     fn get(&self, index: usize, key: usize) -> T {
-        unimplemented!()
+        let addr = self.addr_by_index(index);
+        unsafe { *(addr as *mut T) }
     }
 
     fn set(&self, index: usize, key: usize, att_value: T) {
-        unimplemented!()
+        let addr = self.addr_by_index(index);
+        unsafe { ptr::write(addr as *mut T, att_value) }
     }
 
     fn erase(&self, index: usize, key: usize) {
        // will not erase
     }
 
-    fn mov(&self, index: usize, key: usize, dest: &Self, dest_index: usize) {
-        unimplemented!()
+    fn mov(&self, index: usize, key: usize, src: &Self, src_index: usize) {
+        let val = src.get(src_index, key);
+        self.set(index, key, val)
+    }
+
+    fn dealloc(&self) {
+        dealloc_mem(self.obj_chunk, self.size);
     }
 }
+
+impl <T> ObjectAttachment <T> {
+    fn addr_by_index(&self, index: usize) -> usize {
+        self.obj_chunk + index * self.obj_size
+    }
+}
+
