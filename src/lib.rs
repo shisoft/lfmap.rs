@@ -69,7 +69,7 @@ pub struct ChunkRef {
 }
 
 pub struct Table {
-    chunk: AtomicPtr<Chunk>,
+    old_chunk: AtomicPtr<Chunk>,
     new_chunk: AtomicPtr<Chunk>,
     val_bit_mask: usize, // 0111111..
     inv_bit_mask: usize  // 1000000..
@@ -85,7 +85,7 @@ impl Table {
         let val_bit_mask = !0 << 1 >> 1;
         let chunk = Chunk::alloc_chunk(cap);
         Self {
-            chunk: AtomicPtr::new(chunk),
+            old_chunk: AtomicPtr::new(chunk),
             new_chunk: AtomicPtr::new(chunk),
             val_bit_mask,
             inv_bit_mask: !val_bit_mask
@@ -97,7 +97,7 @@ impl Table {
     }
 
     pub fn get(&self, key: usize) -> Option<usize> {
-        let mut chunk = unsafe { Chunk::borrow(self.chunk.load(SeqCst)) };
+        let mut chunk = unsafe { Chunk::borrow(self.old_chunk.load(SeqCst)) };
         loop {
             let val = self.get_from_chunk(&*chunk, key);
             match val.parsed {
@@ -115,7 +115,7 @@ impl Table {
     pub fn insert(&self, key: usize, value: usize) -> Option<usize> {
         debug!("Inserting key: {}, value: {}", key, value);
         let result = self.ensure_write_new(|new_chunk_ptr| {
-            let old_chunk_ptr = self.chunk.load(Relaxed);
+            let old_chunk_ptr = self.old_chunk.load(Relaxed);
             let copying = new_chunk_ptr != old_chunk_ptr;
             if !copying && self.check_resize(old_chunk_ptr) {
                 debug!("Resized, retry insertion key: {}, value {}", key, value);
@@ -133,6 +133,10 @@ impl Table {
                 ModResult::TableFull => {
                     panic!("Insertion is too fast");
                 }
+                ModResult::Sentinel => {
+                    debug!("Insert new and see sentinel, abort");
+                    return Ok(None);
+                }
                 _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
             };
             if copying {
@@ -149,7 +153,7 @@ impl Table {
 
     pub fn remove(&self, key: usize) -> Option<usize> {
         self.ensure_write_new(|new_chunk_ptr| {
-            let old_chunk_ptr = self.chunk.load(Relaxed);
+            let old_chunk_ptr = self.old_chunk.load(Relaxed);
             let copying = new_chunk_ptr != old_chunk_ptr;
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
@@ -178,7 +182,7 @@ impl Table {
             match f_res {
                 Ok(r) if self.new_chunk.load(SeqCst) == new_chunk_ptr => return r,
                 Err(r) => return r,
-                _ => { debug_assert!(true, "Invalid write new") }
+                _ => { debug!("Invalid write new, retry"); }
             }
         }
     }
@@ -421,7 +425,7 @@ impl Table {
             // resize finished, make changes on the numbers
             new_chunk_ins.occupation.fetch_add(effective_copy, Relaxed);
             debug_assert_ne!(old_chunk_ptr as usize, new_base);
-            if self.chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, Relaxed) != old_chunk_ptr {
+            if self.old_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
                 panic!();
             }
             unsafe { Chunk::mark_garbage(old_chunk_ptr); }
