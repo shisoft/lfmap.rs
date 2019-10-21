@@ -68,6 +68,37 @@ fn parallel_no_resize() {
     }
 }
 
+#[test]
+fn parallel_with_resize() {
+    let map = Arc::new(Table::with_capacity(32));
+    let mut threads = vec![];
+    for i in 5..24 {
+        let map = map.clone();
+        threads.push(
+            thread::spawn(move || {
+                for j in 5..1000 {
+                    map.insert(i + j * 100, i * j);
+                }
+
+            })
+        );
+    }
+    for thread in threads {
+        let _ = thread.join();
+    }
+    for i in 5..24 {
+        for j in 5..1000 {
+            let k = i + j * 100;
+            match map.get(k) {
+                Some(v) => assert_eq!(v, i * j),
+                None => {
+                    panic!("Value should not be None for key: {}", k)
+                }
+            }
+        }
+    }
+}
+
 
 //#![feature(core_intrinsics)]
 //#![feature(test)]
