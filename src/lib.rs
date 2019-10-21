@@ -1,496 +1,584 @@
+#![no_std]
+#![feature(allocator_api)]
 #![feature(core_intrinsics)]
-#![feature(integer_atomics)]
+extern crate alloc;
+#[macro_use]
+extern crate log;
+// usize to usize lock-free, wait free table
 
-extern crate libc;
-extern crate core;
+use alloc::alloc::Global;
+use core::alloc::{Alloc, Layout};
+use core::{mem, ptr, intrinsics};
+use core::sync::atomic::{AtomicUsize, AtomicPtr, fence, AtomicBool};
+use core::sync::atomic::Ordering::{Relaxed, Acquire, Release, SeqCst};
+use core::iter::Copied;
+use core::cmp::Ordering;
+use core::ptr::NonNull;
+use ModOp::Empty;
+use alloc::string::String;
+use core::ops::Deref;
 
-use core::intrinsics;
-use std::ptr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::{thread, time};
+type EntryTemplate = (usize, usize);
 
-const INITIAL_CAPACITY :u64 = 32;
-type KV = u64;
-const KV_BYTES: usize = (64 / 8);
-const KV_BYTES_U64: u64 = KV_BYTES as u64;
+const EMPTY_KEY: usize = 0;
+const EMPTY_VALUE: usize = 0;
+const SENTINEL_VALUE: usize = 1;
 
-
-macro_rules! if_resizing {
-    (
-        $map: ident, $if_exp: expr, $else_exp: expr
-    ) => (
-        {
-            let response;
-            loop {
-                let resizing_counter = $map.resizing.load(Ordering::SeqCst);
-                if $map.prev_table.load(Ordering::SeqCst) != 0 && resizing_counter != 0 {
-                    let prev_count = $map.resizing.compare_and_swap(resizing_counter, resizing_counter + 1, Ordering::SeqCst);
-                    if prev_count != resizing_counter {
-                        continue;
-                    } else {
-                        response = $if_exp;
-                        $map.resizing.fetch_sub(1, Ordering::SeqCst);
-                        break;
-                    }
-                } else {
-                    response = $else_exp;
-                    break;
-                }
-            }
-            response
-        }
-    );
- }
-
-//enum EntryTag {
-//    Empty,
-//    LIVE,
-//    DEAD,
-//    MOVED
-//}
-
-struct Table {
-    body_addr: u64,
-    capacity: u64,
-    contained: u64,
-    meta_addr: u64, // not in the memory
-
+struct Value {
+    raw: usize,
+    parsed: ParsedValue
 }
+
+enum ParsedValue {
+    Val(usize),
+    Prime(usize),
+    Sentinel,
+    Empty
+}
+
+#[derive(Debug)]
+enum ModResult {
+    Replaced(usize),
+    Fail(usize),
+    Sentinel,
+    NotFound,
+    Done(usize), // address of placement
+    TableFull
+}
+
+#[derive(Debug)]
+enum ModOp {
+    Insert(usize),
+    AttemptInsert(usize),
+    Sentinel,
+    Empty
+}
+
+pub struct Chunk {
+    capacity: usize,
+    base: usize,
+    // floating-point multiplication is slow, cache this value and recompute every time when resize
+    occu_limit: usize,
+    occupation: AtomicUsize,
+    referenced: AtomicUsize,
+    is_garbage: AtomicBool,
+}
+
+pub struct ChunkRef {
+    chunk: *mut Chunk
+}
+
+pub struct Table {
+    old_chunk: AtomicPtr<Chunk>,
+    new_chunk: AtomicPtr<Chunk>,
+    val_bit_mask: usize, // 0111111..
+    inv_bit_mask: usize  // 1000000..
+}
+
 impl Table {
-    fn to_raw(&self) -> u64 {
-        unsafe {
-            let mptr = libc::malloc(3 * KV_BYTES) as usize;
-            ptr::write(mptr as *mut KV, self.body_addr);
-            ptr::write((mptr + KV_BYTES) as *mut KV, self.capacity);
-            ptr::write((mptr + KV_BYTES * 2) as *mut KV, self.contained);
-            mptr as u64
+    pub fn with_capacity(cap: usize) -> Self {
+        if !is_power_of_2(cap) {
+            panic!("capacity is not power of 2");
+        }
+        // Each entry key value pair is 2 words
+        // steal 1 bit in the MSB of value indicate Prime(1)
+        let val_bit_mask = !0 << 1 >> 1;
+        let chunk = Chunk::alloc_chunk(cap);
+        Self {
+            old_chunk: AtomicPtr::new(chunk),
+            new_chunk: AtomicPtr::new(chunk),
+            val_bit_mask,
+            inv_bit_mask: !val_bit_mask
         }
     }
-    fn from_raw(ptr: &AtomicU64) -> Table {
-        let mptr = ptr.load(Ordering::SeqCst) as usize;
-        unsafe {
-            Table {
-                body_addr: ptr::read(mptr as *mut KV),
-                capacity: ptr::read((mptr + KV_BYTES) as *mut KV),
-                contained: ptr::read((mptr + KV_BYTES * 2) as *mut KV), 
-                meta_addr: mptr as u64
+
+    pub fn new() -> Self {
+        Self::with_capacity(64)
+    }
+
+    pub fn get(&self, key: usize) -> Option<usize> {
+        let mut chunk = unsafe { Chunk::borrow(self.old_chunk.load(SeqCst)) };
+        loop {
+            let val = self.get_from_chunk(&*chunk, key);
+            match val.parsed {
+                ParsedValue::Prime(val) | ParsedValue::Val(val) => return Some(val),
+                ParsedValue::Sentinel => {
+                    let old_chunk_base = chunk.base;
+                    chunk = unsafe { Chunk::borrow(self.new_chunk.load(SeqCst)) };
+                    debug_assert_ne!(old_chunk_base, chunk.base);
+                }
+                ParsedValue::Empty => return None
             }
         }
     }
-    fn incr_contained(&self) -> u64 {
-        unsafe {
-            intrinsics::atomic_xadd((self.meta_addr + KV_BYTES_U64 * 2) as *mut KV, 1)
-        }
-    }
-    fn contained(&self) -> u64 {
-        unsafe {
-            intrinsics::atomic_load((self.meta_addr + KV_BYTES_U64 * 2) as *mut KV)
-        }
-    }
-}
 
-pub struct Entry {
-    key: u64,
-    val: u64,
-    tag: u64,
-}
+    pub fn insert(&self, key: usize, value: usize) -> Option<usize> {
+        debug!("Inserting key: {}, value: {}", key, value);
+        let result = self.ensure_write_new(|new_chunk_ptr| {
+            let old_chunk_ptr = self.old_chunk.load(Relaxed);
+            let copying = new_chunk_ptr != old_chunk_ptr;
+            if !copying && self.check_resize(old_chunk_ptr) {
+                debug!("Resized, retry insertion key: {}, value {}", key, value);
+                return Err(self.insert(key, value));
+            }
+            let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+            let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
+            let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value));
+            let mut result = None;
+            match value_insertion {
+                ModResult::Done(_) => {},
+                ModResult::Replaced(v) | ModResult::Fail(v) => {
+                    result = Some(v)
+                }
+                ModResult::TableFull => {
+                    panic!("Insertion is too fast");
+                }
+                ModResult::Sentinel => {
+                    debug!("Insert new and see sentinel, abort");
+                    return Ok(None);
+                }
+                _ => unreachable!("{:?}, copying: {}", value_insertion, copying)
+            };
+            if copying {
+                debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
+                fence(Acquire);
+                self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
+                fence(Release);
+            }
+            new_chunk.occupation.fetch_add(1, Relaxed);
+            Ok(result)
+        });
+        result
+    }
 
-impl Entry {
-    fn new_from(ptr: u64) -> Option<Entry> {
-        unsafe {
-            let ptr = ptr as u64;
-            let key = intrinsics::atomic_load(ptr as *mut KV);
-            let val_ptr = ptr + KV_BYTES_U64;
-            let val = intrinsics::atomic_load(val_ptr as *mut KV);
-            if key == 0 || val == 0 {
-                None
-            } else {
-                Some(
-                    Entry {
-                        tag: {
-                            match val {
-                                2 | 3 => val,
-                                _ => 1,
-                            }
-                        },
-                        key: key,
-                        val: val
-                    }
-                )
+    pub fn remove(&self, key: usize) -> Option<usize> {
+        self.ensure_write_new(|new_chunk_ptr| {
+            let old_chunk_ptr = self.old_chunk.load(Relaxed);
+            let copying = new_chunk_ptr != old_chunk_ptr;
+            let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+            let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
+            let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
+            match res {
+                ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
+                    debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
+                    fence(Acquire);
+                    self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
+                    fence(Release);
+                }
+                ModResult::TableFull => panic!("need to handle TableFull by remove"),
+                _ => {}
+            }
+            Ok(match res {
+                ModResult::Replaced(v) => Some(v),
+                _ => None
+            })
+        })
+    }
+
+    fn ensure_write_new<R, F>(&self, f: F) -> R where F: Fn(*mut Chunk) -> Result<R, R> {
+        loop {
+            let new_chunk_ptr = self.new_chunk.load(SeqCst);
+            let f_res = f(new_chunk_ptr);
+            match f_res {
+                Ok(r) if self.new_chunk.load(SeqCst) == new_chunk_ptr => return r,
+                Err(r) => return r,
+                _ => { debug!("Invalid write new, retry"); }
             }
         }
     }
-    fn cas_val(ptr: u64, old: KV, new: KV) -> (KV, bool) {
-        unsafe {
-            intrinsics::atomic_cxchg((ptr + KV_BYTES_U64) as *mut KV, old, new)
-        }
-    }
-    fn set_val(ptr: u64, val: KV) {
-        unsafe {
-            intrinsics::atomic_store((ptr + KV_BYTES_U64) as *mut KV, val);
-        }
-    }
-    fn cas_val_to(ptr: u64, new: KV) -> KV {
-        let ptr = ptr + KV_BYTES_U64;
-        unsafe {
-            let mut old = intrinsics::atomic_load(ptr as *mut KV);
-            loop {
-                let (val, ok) = intrinsics::atomic_cxchg(ptr as *mut KV, old, new);
-                if ok {
-                    return old;
-                } else {
-                    old = val;
+
+    fn get_from_chunk(&self, chunk: &Chunk, key: usize) -> Value {
+        let mut idx = key;
+        let entry_size = mem::size_of::<EntryTemplate>();
+        let cap = chunk.capacity;
+        let base = chunk.base;
+        let mut counter = 0;
+        while counter < cap {
+            idx &= (cap - 1);
+            let addr = base + idx * entry_size;
+            let k = self.get_key(addr);
+            if k == key {
+                let val_res = self.get_value(addr);
+                match val_res.parsed {
+                    ParsedValue::Empty => {},
+                    _ => return val_res
                 }
             }
+            if k == EMPTY_KEY {
+                return Value::new(0, self);
+            }
+            idx += 1; // reprobe
+            counter += 1;
+        }
+
+        // not found
+        return Value::new(0, self);
+    }
+
+    fn modify_entry(&self, chunk: &Chunk, key: usize, op: ModOp) -> ModResult {
+        let cap = chunk.capacity;
+        let base = chunk.base;
+        let mut idx = key;
+        let entry_size = mem::size_of::<EntryTemplate>();
+        let mut replaced = None;
+        let mut count = 0;
+        while count <= cap {
+            idx &= (cap - 1);
+            let addr = base + idx * entry_size;
+            let k = self.get_key(addr);
+            if k == key {
+                // Probing non-empty entry
+                let val = self.get_value(addr);
+                match &val.parsed {
+                    ParsedValue::Val(v) | ParsedValue::Prime(v) => {
+                        match op {
+                            ModOp::Sentinel => {
+                                self.set_sentinel(addr);
+                                return ModResult::Done(addr);
+                            }
+                            ModOp::Empty | ModOp::Insert(_) => {
+                                if !self.set_tombstone(addr, val.raw) {
+                                    // this insertion have conflict with others
+                                    // other thread changed the value
+                                    // should fail (?)
+                                    return ModResult::Fail(*v);
+                                } else {
+                                    // we have put tombstone on the value
+                                    replaced = Some(*v);
+                                }
+                            }
+                            ModOp::AttemptInsert(_) => {
+                                // Attempting insert existed entry, skip
+                                return ModResult::Fail(*v);
+                            }
+                        }
+                        match op {
+                            ModOp::Empty => {
+                                return ModResult::Replaced(*v)
+                            }
+                            _ => {}
+                        }
+                    }
+                    ParsedValue::Empty => {
+                        // found the key with empty value, shall do nothing and continue probing
+                    },
+                    ParsedValue::Sentinel => return ModResult::Sentinel // should not reachable for insertion happens on new list
+                }
+
+            } else if k == EMPTY_KEY {
+                // Probing empty entry
+                let put_in_empty = |value| {
+                    // found empty slot, try to CAS key and value
+                    if self.cas_value(addr, 0, value) {
+                        // CAS value succeed, shall store key
+                        unsafe { intrinsics::atomic_store_relaxed(addr as *mut usize, key) }
+                        match replaced {
+                            Some(v) => ModResult::Replaced(v),
+                            None => ModResult::Done(addr)
+                        }
+                    } else {
+                        // CAS failed, this entry have been taken, reprobe
+                        ModResult::Fail(0)
+                    }
+                };
+                let mod_res = match op {
+                    ModOp::Insert(val) | ModOp::AttemptInsert(val) => {
+                        debug!("Inserting entry key: {}, value: {}, raw: {:b}, addr: {}",
+                               key, val & self.val_bit_mask, val, addr);
+                        put_in_empty(val)
+                    },
+                    ModOp::Sentinel => put_in_empty(SENTINEL_VALUE),
+                    ModOp::Empty => return ModResult::Fail(0),
+                    _ => unreachable!("{:?}", op)
+                };
+                match &mod_res {
+                    ModResult::Fail(_) => {},
+                    _ => return mod_res
+                }
+            }
+            idx += 1; // reprobe
+            count += 1;
+        }
+        match op {
+            ModOp::Insert(v) | ModOp::AttemptInsert(v)  => ModResult::TableFull,
+            _ => ModResult::NotFound
         }
     }
-    fn load_val(ptr: u64) -> KV {
-        unsafe {
-            intrinsics::atomic_load_relaxed((ptr + KV_BYTES_U64) as *mut KV)
-        }
+
+    #[inline(always)]
+    fn get_key(&self, entry_addr: usize) -> usize {
+        unsafe { intrinsics::atomic_load_relaxed(entry_addr as *mut usize) }
     }
-    fn cas_key(ptr: u64, old: KV, new:KV) -> (KV, bool) {
-        unsafe {
-            intrinsics::atomic_cxchg(ptr as *mut KV, old, new)
+
+    #[inline(always)]
+    fn get_value(&self, entry_addr: usize) -> Value {
+        let addr = entry_addr + mem::size_of::<usize>();
+        let val = unsafe { intrinsics::atomic_load_relaxed(addr as *mut usize) };
+        Value::new(val, self)
+    }
+
+    #[inline(always)]
+    fn set_tombstone(&self, entry_addr: usize, original: usize) -> bool {
+        self.cas_value(entry_addr, original, 0)
+    }
+    #[inline(always)]
+    fn set_sentinel(&self, entry_addr: usize) {
+        let addr = entry_addr + mem::size_of::<usize>();
+        unsafe { intrinsics::atomic_store_relaxed(addr as *mut usize, SENTINEL_VALUE) }
+    }
+    #[inline(always)]
+    fn cas_value(&self, entry_addr: usize, original: usize, value: usize) -> bool {
+        let addr = entry_addr + mem::size_of::<usize>();
+        unsafe { intrinsics::atomic_cxchg_relaxed(addr as *mut usize, original, value).0 == original }
+    }
+
+    #[inline(always)]
+    fn check_resize(&self, old_chunk_ptr: *mut Chunk) -> bool {
+        let old_chunk_ins = unsafe { Chunk::borrow(old_chunk_ptr) };
+        let occupation = old_chunk_ins.occupation.load(Relaxed);
+        let occu_limit = old_chunk_ins.occu_limit;
+        if occupation > occu_limit {
+            // resize
+            debug!("Resizing");
+            let old_cap = old_chunk_ins.capacity;
+            let mult = if old_cap < 2048 { 4 } else { 1 };
+            let new_cap = old_cap << mult;
+            let new_chunk_ptr = Chunk::alloc_chunk(new_cap);
+            if self.new_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
+                // other thread have allocated new chunk and wins the competition, exit
+                unsafe { Chunk::mark_garbage(new_chunk_ptr); }
+                return true;
+            }
+            let new_chunk_ins = unsafe { Chunk::borrow(new_chunk_ptr) };
+            let new_base = new_chunk_ins.base;
+            let mut old_address = old_chunk_ins.base as usize;
+            let boundary = old_address + chunk_size_of(old_cap);
+            let mut effective_copy = 0;
+            while old_address < boundary  {
+                // iterate the old chunk to extract entries that is NOT empty
+                let key = self.get_key(old_address);
+                let value = self.get_value(old_address);
+                if key != EMPTY_KEY // Empty entry, skip
+                {
+                    // Reasoning value states
+                    match &value.parsed {
+                        ParsedValue::Val(v) => {
+                            // Insert entry into new chunk, in case of failure, skip this entry
+                            // Value should be primed
+                            debug!("Moving key: {}, value: {}", key, v);
+                            let primed_val = value.raw | self.inv_bit_mask;
+                            let new_chunk_insertion = self.modify_entry(
+                                &*new_chunk_ins,
+                                key,
+                                ModOp::AttemptInsert(primed_val)
+                            );
+                            let inserted_addr = match new_chunk_insertion {
+                                ModResult::Done(addr) => Some(addr), // continue procedure
+                                ModResult::Fail(v) => None,
+                                ModResult::Replaced(_) => {
+                                    unreachable!("Attempt insert does not replace anything");
+                                }
+                                ModResult::Sentinel => {
+                                    unreachable!("New chunk should not have sentinel");
+                                }
+                                ModResult::NotFound => {
+                                    unreachable!()
+                                }
+                                ModResult::TableFull => panic!()
+                            };
+                            if let Some(entry_addr) = inserted_addr {
+                                fence(Acquire);
+                                // cas to ensure sentinel into old chunk
+                                if self.cas_value(old_address, value.raw, SENTINEL_VALUE) {
+                                    // strip prime
+                                    let stripped = primed_val & self.val_bit_mask;
+                                    debug_assert_ne!(stripped, SENTINEL_VALUE);
+                                    if self.cas_value(entry_addr, primed_val, stripped) {
+                                        debug!("Effective copy key: {}, value {}, addr: {}",
+                                               key, stripped, entry_addr);
+                                        effective_copy += 1;
+                                    }
+                                } else {
+                                    fence(Release);
+                                    continue; // retry this entry
+                                }
+                                fence(Release);
+                            }
+                        }
+                        ParsedValue::Prime(v) => {
+                            // Should never have prime in old chunk
+                            panic!("Prime in old chunk when resizing")
+                        }
+                        ParsedValue::Sentinel => {
+                            // Sentinel, skip
+                            // Sentinel in old chunk implies its new value have already in the new chunk
+                            debug!("Skip copy sentinel");
+                        }
+                        ParsedValue::Empty => {
+                            // Empty, skip
+                            debug!("Skip copy empty, key: {}", key);
+                        }
+                    }
+                }
+                old_address += entry_size();
+            }
+            // resize finished, make changes on the numbers
+            new_chunk_ins.occupation.fetch_add(effective_copy, Relaxed);
+            debug_assert_ne!(old_chunk_ptr as usize, new_base);
+            if self.old_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
+                panic!();
+            }
+            unsafe { Chunk::mark_garbage(old_chunk_ptr); }
+            debug!("{}", self.dump(new_base, new_cap));
+            return true;
+        }
+        false
+    }
+
+    fn dump(&self, base: usize, cap: usize) -> &str {
+        for i in 0..cap {
+            let addr = base + i * entry_size();
+            debug!("{}-{}\t", self.get_key(addr), self.get_value(addr).raw);
+            if i % 8 == 0 { debug!("") }
+        }
+        "DUMPED"
+    }
+}
+
+impl Value {
+    pub fn new(val: usize, table: &Table) -> Self {
+        let res = {
+            if val == 0 {
+                ParsedValue::Empty
+            } else {
+                let actual_val = val & table.val_bit_mask;
+                let flag = val & table.inv_bit_mask;
+                if flag == 1 {
+                    ParsedValue::Prime(actual_val)
+                } else if actual_val == 1 {
+                    ParsedValue::Sentinel
+                } else {
+                    ParsedValue::Val(actual_val)
+                }
+            }
+        };
+        Value {
+            raw: val,
+            parsed: res
         }
     }
 }
 
-pub struct Map {
-    curr_table: AtomicU64,
-    prev_table: AtomicU64,
-    entry_size: u64,
-
-    resizing: AtomicU64,
-}
-
-fn new_table_body(entry_size: u64, capacity: u64) -> u64 {
-    let table_size = (entry_size * capacity) as usize;
-    let addr = unsafe{libc::malloc(table_size)} as u64;
-    unsafe {
-        libc::memset(addr as *mut libc::c_void, 0, table_size);
+impl ParsedValue {
+    fn unwrap(&self) -> usize {
+        match self {
+            ParsedValue::Val(v) | ParsedValue::Val(v) => *v,
+            _ => panic!()
+        }
     }
-    addr
 }
-fn is_power_of_2(num: u64) -> bool {
+
+impl Chunk {
+    fn alloc_chunk(capacity: usize) -> *mut Self {
+        let base = alloc_mem(chunk_size_of(capacity));
+        let ptr = alloc_mem(mem::size_of::<Self>()) as *mut Self;
+        unsafe { ptr::write(ptr, Self {
+            base, capacity,
+            occupation: AtomicUsize::new(0),
+            occu_limit: occupation_limit(capacity),
+            is_garbage: AtomicBool::new(false),
+            referenced: AtomicUsize::new(0)
+        }) };
+        ptr
+    }
+    unsafe fn borrow(ptr: *mut Chunk) -> ChunkRef {
+        let chunk = &*ptr;
+        chunk.referenced.fetch_add(1, Relaxed);
+        ChunkRef {
+            chunk: ptr
+        }
+    }
+
+    unsafe fn borrow_if_cond(ptr: *mut Chunk, cond: bool) -> ChunkRef {
+        if cond { unsafe { Chunk::borrow(ptr) } } else { ChunkRef::null_ref() }
+    }
+
+    unsafe fn mark_garbage(ptr: *mut Chunk) {
+        // Caller promise this chunk will not be reachable from the outside except snapshot in threads
+        let chunk = &*ptr;
+        chunk.is_garbage.store(true, Relaxed);
+        Self::check_gc(ptr);
+    }
+    unsafe fn check_gc(ptr: *mut Chunk) {
+        let chunk = &*ptr;
+        if  chunk.referenced.load(Relaxed) == 0 &&
+            // CAS is_garbage and assume true to avoid double free by other threads
+            chunk.is_garbage.compare_and_swap(true, false, Relaxed) == true
+        {
+            dealloc_mem(ptr as usize, mem::size_of::<Self>());
+            dealloc_mem(chunk.base, chunk_size_of(chunk.capacity));
+        }
+    }
+}
+
+impl Drop for ChunkRef {
+    fn drop(&mut self) {
+        if self.chunk as usize == 0 { return }
+        let chunk = unsafe { &*self.chunk };
+        chunk.referenced.fetch_sub(1, Relaxed);
+        unsafe { Chunk::check_gc(self.chunk) }
+    }
+}
+
+impl Deref for ChunkRef {
+    type Target = Chunk;
+
+    fn deref(&self) -> &Self::Target {
+        debug_assert_ne!(self.chunk as usize, 0);
+        unsafe { &*self.chunk }
+    }
+}
+
+impl ChunkRef {
+    fn null_ref() -> Self { Self { chunk: 0 as *mut Chunk } }
+}
+
+fn is_power_of_2(num: usize) -> bool {
     if num < 1 {return false}
     if num <= 2 {return true}
     if num % 2 == 1 {return false};
     return is_power_of_2(num / 2);
 }
-impl Map {
-    pub fn with_options(capacity: u64) -> Map {
-        if !is_power_of_2(capacity) {
-            panic!("Capacity must be power of 2 but got: {}", capacity);
-        }
-        let entry_size = KV_BYTES * 2;
-        let table_body_addr = new_table_body(entry_size as u64, capacity);
-        Map {
-            curr_table: AtomicU64::new(
-                Table{
-                    body_addr: table_body_addr,
-                    capacity: capacity,
-                    meta_addr: 0,
-                    contained: 0
-                }.to_raw()
-            ),
-            prev_table: AtomicU64::new(0),
-            entry_size: entry_size as u64,
-            resizing: AtomicU64::new(0),
-        }
-    }
-    pub fn new() -> Map {
-        Map::with_options(INITIAL_CAPACITY)
-    }
-    fn current(&self) -> &AtomicU64 {
-        &self.curr_table
-    }
-    fn find(&self, k: u64, table_ptr: &AtomicU64) -> (Option<Entry>, KV) {
-        let table = Table::from_raw(table_ptr);
-        let hash = k;
-        let mut slot = self.table_slot(hash, &table);
-        loop {
-            let ptr = table.body_addr + slot * self.entry_size;
-            let entry = Entry::new_from(ptr);
-            match entry {
-                Some(entry) => {
-                    if entry.key != k {
-                        slot = self.table_slot(slot + 1, &table);
-                    } else {
-                        return (Some(entry), ptr)
-                    }
-                },
-                None => return (None, ptr)
-            }
-        };
-    }
-    fn resize(&self) -> bool {
-        if self.resizing.compare_and_swap(0, 1, Ordering::SeqCst) == 0 {
-            assert_eq!(self.prev_table.load(Ordering::SeqCst), 0);
-            let prev_table = Table::from_raw(&self.curr_table);
-            let new_capacity = prev_table.capacity * 2;
-            let new_addr = new_table_body(self.entry_size, new_capacity);
-            self.prev_table.store(self.curr_table.load(Ordering::SeqCst), Ordering::SeqCst);
-            self.curr_table.store(
-                Table{
-                    body_addr: new_addr,
-                    capacity: new_capacity,
-                    contained: 0,
-                    meta_addr: 0,
-                }.to_raw(), Ordering::SeqCst);
-            let new_table = Table::from_raw(&self.curr_table);
-            let mut prev_clear = true;
-            loop {
-                for slot in 0..prev_table.capacity {
-                    let ptr = prev_table.body_addr + slot * self.entry_size;
-                    let entry = Entry::new_from(ptr);
-                    match entry {
-                        Some(entry) => {
-                            match entry.tag {
-                                1 => {
-                                    self.insert_to_table(&new_table, entry.key, None, Some(Entry::load_val(ptr)));
-                                    Entry::set_val(ptr, 3);
-                                    prev_clear = false;
-                                }
-                                _ => {},
-                            }
-                        },
-                        None => {}
-                    }
-                }
-                if prev_clear {
-                    break;
-                } else {
-                    prev_clear = true;
-                }
-            }
-            while self.resizing.compare_and_swap(1, 0, Ordering::SeqCst) != 1 {}
-            self.prev_table.store(0, Ordering::SeqCst);
-            unsafe {
-                libc::free(prev_table.body_addr as *mut libc::c_void);
-                libc::free(prev_table.meta_addr as *mut libc::c_void);
-            }
-            true
-        } else {
-            thread::sleep(time::Duration::from_millis(1)); //weird, but essential
-            false
-        }
-    }
-    fn set_entry_moved(&self, k: KV) {
-        if_resizing!(self, {
-            let (entry, ptr) = self.find(k, &self.prev_table);
-            match entry {
-                Some(_) => Entry::set_val(ptr, 3),
-                None => {}
-            }
-        }, {});
-    }
 
-    pub fn insert(&self, k: u64, v: u64) -> Option<KV> {
-        if k == 0 {panic!("key: {} is reserved for internal use", k)}
-        match v {
-            0 | 2 | 3 => panic!("value: {} is reserved for internal use", v),
-            _ => {}
-        }
-        let mut table = Table::from_raw(&self.current());
-        while table.contained() > table.capacity / 2  {
-            self.resize();
-            table = Table::from_raw(&self.current());
-        }
-        self.insert_to_table(&table, k, None, Some(v))
-    }
-    fn insert_to_table(&self, table: &Table, k: KV, expected: Option<KV>, v: Option<KV>) -> Option<KV> {
-        let hash = k;
-        let mut slot = self.table_slot(hash, &table);
-        let mut result = None;
-        loop {
-            let ptr = table.body_addr + slot * self.entry_size;
-            let entry = Entry::new_from(ptr);
-            match entry {
-                Some(entry) => {
-                    if entry.key != k {
-                        slot = self.table_slot(slot + 1, &table);
-                        continue;
-                    } else {
-                        match v {
-                            Some(v) => {
-                                match expected {
-                                    None => {
-                                        result = Some(Entry::cas_val_to(ptr, v));
-                                    }
-                                    Some(exp_v) => {
-                                        let (pv, _) = Entry::cas_val(ptr, exp_v, v);
-                                        result = Some(pv);
-                                    }
-                                }
-                            },
-                            None => {
-                                result = Some(entry.val);
-                            }
-                        }
-                        break;
-                    }
-                },
-                None => {
-                    match expected {
-                        None | Some(0) => {
-                            let (_, ok) = Entry::cas_key(ptr, 0, k);
-                            if !ok {
-                                slot = self.table_slot(slot + 1, &table);
-                                continue;
-                            }
-                            match v {
-                                Some(v) => {
-                                    match expected {
-                                        None => {
-                                            Entry::set_val(ptr, v);
-                                        },
-                                        Some(0) => {
-                                            let (prev, _) = Entry::cas_val(ptr, 0, v);
-                                            result = Some(prev);
-                                        }
-                                        _ => {}
-                                    }
-                                },
-                                None => {}
-                            }
-                            table.incr_contained();
-                            break;
-                        },
-                        Some(_) => {return None;}
-                    }
-                }
-            }
-        };
-        self.set_entry_moved(k);
-        match result {
-            None => None,
-            Some(0) | Some(1) | Some(2) | Some(3) => None,
-            _ => result,
-        }
-    }
-    pub fn update_if(&self, k: KV, expected: KV, v: KV) -> Option<KV> {
-        let update_current = |expected| {
-            self.insert_to_table(&Table::from_raw(&self.curr_table), k, Some(expected), Some(v))
-        };
-        if_resizing!(self, {
-            let (prev_entry, _) = self.find(k, &self.prev_table);
-            match prev_entry {
-                None => update_current(expected),
-                Some(prev_entry) => {
-                    match prev_entry.tag {
-                        1 => {
-                            let prev_val = prev_entry.val;
-                            let mut curr_tb_prev = None;
-                            if prev_val == expected {
-                                curr_tb_prev = update_current(0);
-                            }
-                            match curr_tb_prev {
-                                None | Some(0) => Some(prev_val),
-                                Some(pv) => Some(pv)
-                            }
-                        }
-                        _ => update_current(expected),
-                    }
-                }
-            }
-        }, {
-            update_current(expected)
-        })
-    }
-    pub fn compute<U: Fn(KV, KV) -> KV>(&self, k: KV, compute_val: U) -> Option<KV> {
-        let mut val_opt = self.get(k);
-        loop {
-            match val_opt {
-                Some(val) => {
-                    let computed = compute_val(k, val);
-                    let update_res = self.update_if(k, val, computed);
-                    match update_res {
-                        Some(update_res) => {
-                            if update_res == val {
-                                return Some(computed);
-                            } else {
-                                val_opt = Some(update_res);
-                                continue;
-                            }
-                        },
-                        None => {
-                            return None;
-                        }
-                    }
-                },
-                None => {
-                    return None;
-                }
-            }
-        }
-    }
-    fn get_from_entry_ptr(&self, entry: Option<Entry>) -> Option<KV> {
-        match entry {
-            Some(entry) => {
-                match entry.tag {
-                    1 => Some(entry.val),
-                    _ => None,
-                }
-            },
-            None => None
-        }
-    }
-    pub fn get(&self, k: KV) -> Option<KV> {
-        let read_current = || {
-            let (entry, _) = self.find(k, &self.current());
-            self.get_from_entry_ptr(entry)
-        };
-        if_resizing!(self, {
-            let (prev_entry, _) = self.find(k, &self.prev_table);
-            match prev_entry {
-                None => read_current(),
-                Some(prev_entry) => {
-                    match prev_entry.tag {
-                        3 | 0 => read_current(),
-                        1 => {
-                            self.get_from_entry_ptr(Some(prev_entry))
-                        }
-                        _ => None
-                    }
-                }
-            }
-        }, {
-            read_current()
-        })
-    }
-    pub fn remove(&self, k: KV) -> Option<KV> {
-        let curr_t_val = self.insert_to_table(&Table::from_raw(&self.current()), k, None, Some(2));
-        let mut prev_t_val = None;
-        if_resizing!(self, {
-            let prev_table = Table::from_raw(&self.prev_table);
-            prev_t_val = self.insert_to_table(&prev_table, k, None, Some(3));
-        }, {});
-        if curr_t_val.is_some() {
-            curr_t_val
-        } else {
-            prev_t_val
-        }
-    }
-    fn table_slot(&self, hash: u64, table: &Table) -> u64 {
-        hash & (table.capacity - 1)
-    }
-    pub fn capacity(&self) -> u64 {
-        Table::from_raw(&self.current()).capacity
-    }
+#[inline(always)]
+fn occupation_limit(cap: usize) -> usize {
+    (cap as f64 * 0.7f64) as usize
 }
-impl Drop for Map {
-    fn drop(&mut self) {
-        let curr_table = Table::from_raw(&self.curr_table);
-        let have_prev_table = self.prev_table.load(Ordering::SeqCst) != 0;
-        unsafe {
-            if have_prev_table {
-                let prev_table = Table::from_raw(&self.prev_table);
-                libc::free(prev_table.body_addr as *mut libc::c_void);
-                libc::free(prev_table.meta_addr as *mut libc::c_void);
-            }
-            libc::free(curr_table.body_addr as *mut libc::c_void);
-            libc::free(curr_table.meta_addr as *mut libc::c_void);
-        }
-    }
+
+#[inline(always)]
+fn entry_size() -> usize {
+    mem::size_of::<EntryTemplate>()
+}
+
+#[inline(always)]
+fn chunk_size_of(cap: usize) -> usize {
+    cap * entry_size()
+}
+
+fn alloc_mem(size: usize) -> usize {
+    let align = mem::align_of::<EntryTemplate>();
+    let layout = Layout::from_size_align(size, align).unwrap();
+    // must be all zeroed
+    unsafe { Global.alloc_zeroed(layout) }.unwrap().as_ptr() as usize
+}
+
+fn dealloc_mem(ptr: usize, size: usize) {
+    let align = mem::align_of::<EntryTemplate>();
+    let layout = Layout::from_size_align(size, align).unwrap();
+    unsafe { Global.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
+}
+
+#[cfg(test)]
+mod tests {
+
 }
