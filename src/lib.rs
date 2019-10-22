@@ -53,9 +53,9 @@ struct ModOutput  {
 }
 
 #[derive(Debug)]
-enum ModOp {
-    Insert(usize),
-    AttemptInsert(usize),
+enum ModOp<T> {
+    Insert(usize, T),
+    AttemptInsert(usize, T),
     Sentinel,
     Empty
 }
@@ -133,7 +133,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
             }
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
-            let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value));
+            let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value, attached_val));
             let insertion_index = value_insertion.index;
             let mut result = None;
             match value_insertion.result {
@@ -150,7 +150,6 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                 }
                 _ => unreachable!("{:?}, copying: {}", value_insertion.result, copying)
             }
-            new_chunk.attachment.set(insertion_index, key, attached_val);
             if copying {
                 debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
                 fence(Acquire);
@@ -228,7 +227,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
         return (Value::new(0, self), 0);
     }
 
-    fn modify_entry(&self, chunk: &Chunk<V, A>, key: usize, op: ModOp) -> ModOutput {
+    fn modify_entry(&self, chunk: &Chunk<V, A>, key: usize, op: ModOp<V>) -> ModOutput {
         let cap = chunk.capacity;
         let base = chunk.base;
         let mut idx = key;
@@ -249,7 +248,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                                 self.set_sentinel(addr);
                                 return ModOutput::new(ModResult::Done(addr), idx);
                             }
-                            ModOp::Empty | ModOp::Insert(_) => {
+                            ModOp::Empty | ModOp::Insert(_, _) => {
                                 if !self.set_tombstone(addr, val.raw) {
                                     // this insertion have conflict with others
                                     // other thread changed the value
@@ -260,7 +259,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                                     replaced = Some(*v);
                                 }
                             }
-                            ModOp::AttemptInsert(_) => {
+                            ModOp::AttemptInsert(_, _) => {
                                 // Attempting insert existed entry, skip
                                 return ModOutput::new(ModResult::Fail(*v), idx);
                             }
@@ -280,10 +279,13 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
 
             } else if k == EMPTY_KEY {
                 // Probing empty entry
-                let put_in_empty = |value| {
+                let put_in_empty = |value, attach_val| {
                     // found empty slot, try to CAS key and value
                     if self.cas_value(addr, 0, value) {
                         // CAS value succeed, shall store key
+                        if let Some(attach_val) = attach_val {
+                            chunk.attachment.set(idx, k, attach_val);
+                        }
                         unsafe { intrinsics::atomic_store_relaxed(addr as *mut usize, key) }
                         match replaced {
                             Some(v) => ModResult::Replaced(v),
@@ -295,14 +297,14 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                     }
                 };
                 let mod_res = match op {
-                    ModOp::Insert(val) | ModOp::AttemptInsert(val) => {
+                    ModOp::Insert(val, attach_val) | ModOp::AttemptInsert(val, attach_val) => {
                         debug!("Inserting entry key: {}, value: {}, raw: {:b}, addr: {}",
                                key, val & self.val_bit_mask, val, addr);
-                        put_in_empty(val)
+                        put_in_empty(val, Some(attach_val))
                     },
-                    ModOp::Sentinel => put_in_empty(SENTINEL_VALUE),
+                    ModOp::Sentinel => put_in_empty(SENTINEL_VALUE, None),
                     ModOp::Empty => return ModOutput::new(ModResult::Fail(0), idx),
-                    _ => unreachable!("{:?}", op)
+                    _ => unreachable!()
                 };
                 match &mod_res {
                     ModResult::Fail(_) => {},
@@ -313,7 +315,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
             count += 1;
         }
         match op {
-            ModOp::Insert(v) | ModOp::AttemptInsert(v)  => ModOutput::new(ModResult::TableFull, 0),
+            ModOp::Insert(_, _) | ModOp::AttemptInsert(_, _)  => ModOutput::new(ModResult::TableFull, 0),
             _ => ModOutput::new(ModResult::NotFound, 0)
         }
     }
@@ -381,16 +383,11 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                             // Value should be primed
                             debug!("Moving key: {}, value: {}", key, v);
                             let primed_val = value.raw | self.inv_bit_mask;
+                            let attached_val = old_chunk_ins.attachment.get(idx, key);
                             let new_chunk_insertion = self.modify_entry(
                                 &*new_chunk_ins,
                                 key,
-                                ModOp::AttemptInsert(primed_val)
-                            );
-                            new_chunk_ins.attachment.mov(
-                                idx,
-                                key,
-                                &old_chunk_ins.attachment,
-                                new_chunk_insertion.index
+                                ModOp::AttemptInsert(primed_val, attached_val)
                             );
                             let inserted_addr = match new_chunk_insertion.result {
                                 ModResult::Done(addr) => Some(addr), // continue procedure
@@ -424,6 +421,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                                 }
                                 fence(Release);
                             }
+                            old_chunk_ins.attachment.erase(idx, key);
                         }
                         ParsedValue::Prime(v) => {
                             // Should never have prime in old chunk
@@ -617,7 +615,6 @@ pub trait Attachment<V> {
     fn get(&self, index: usize, key: usize) -> V;
     fn set(&self, index: usize, key: usize, att_value: V);
     fn erase(&self, index: usize, key: usize);
-    fn mov(&self, index: usize, key: usize, src: &Self, src_index: usize);
     fn dealloc(&self);
 }
 
@@ -632,8 +629,6 @@ impl Attachment <()> for WordAttachment {
     fn set(&self, index: usize, key: usize, att_value: ()) {}
 
     fn erase(&self, index: usize, key: usize) {}
-
-    fn mov(&self, index: usize, key: usize, src: &Self, src_index: usize) {}
 
     fn dealloc(&self) {}
 }
@@ -672,11 +667,6 @@ impl  <T: Copy> Attachment<T> for ObjectAttachment<T> {
 
     fn erase(&self, index: usize, key: usize) {
        // will not erase
-    }
-
-    fn mov(&self, index: usize, key: usize, src: &Self, src_index: usize) {
-        let val = src.get(src_index, key);
-        self.set(index, key, val)
     }
 
     fn dealloc(&self) {

@@ -1,6 +1,6 @@
 extern crate lfmap;
 use lfmap::*;
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::thread;
 
 #[test]
@@ -137,6 +137,45 @@ fn parallel_with_resize() {
         }
     }
 
+
+    #[test]
+    fn obj_map() {
+        #[derive(Copy, Clone)]
+        struct Obj {
+            a: usize,
+            b: usize,
+            c: usize,
+            d: usize
+        }
+        impl Obj {
+            fn new(num: usize) -> Self {
+                Obj {
+                    a: num,
+                    b: num + 1,
+                    c: num + 2,
+                    d: num + 3
+                }
+            }
+            fn validate(&self, num: usize) {
+                assert_eq!(self.a, num);
+                assert_eq!(self.b, num + 1);
+                assert_eq!(self.c, num + 2);
+                assert_eq!(self.d, num + 3);
+            }
+        }
+        let map = ObjectMap::with_capacity(16);
+        for i in 5..2048 {
+            map.insert(i, Obj::new(i));
+        }
+        for i in 5..2048 {
+            match map.get(i) {
+                Some(r) => {
+                    r.validate(i)
+                },
+                None => panic!("{}", i)
+            }
+        }
+    }
 
 //#![feature(core_intrinsics)]
 //#![feature(test)]
