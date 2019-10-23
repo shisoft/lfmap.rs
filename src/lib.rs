@@ -162,28 +162,38 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
         result
     }
 
-    pub fn remove(&self, key: usize) -> Option<usize> {
+    pub fn remove(&self, key: usize) -> Option<(usize, V)> {
         self.ensure_write_new(|new_chunk_ptr| {
             let old_chunk_ptr = self.old_chunk.load(Relaxed);
             let copying = new_chunk_ptr != old_chunk_ptr;
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
-            let res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
+            let mut res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
+            let mut retr = None;
             match res.result {
-                ModResult::Done(_) | ModResult::Replaced(_) | ModResult::NotFound => if copying {
+                ModResult::Done(v) | ModResult::Replaced(v) => if copying {
+                    retr = Some((v, new_chunk.attachment.get(res.index, key)));
                     debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
                     fence(Acquire);
                     self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
                     fence(Release);
                     new_chunk.attachment.erase(res.index, key);
                 }
+                ModResult::NotFound => {
+                    let remove_from_old = self.modify_entry(&*old_chunk, key, ModOp::Empty);
+                    match remove_from_old.result {
+                        ModResult::Done(v) | ModResult::Replaced(v) => {
+                            retr = Some((v, new_chunk.attachment.get(res.index, key)));
+                            old_chunk.attachment.erase(res.index, key);
+                        },
+                        _ => {}
+                    }
+                    res = remove_from_old;
+                }
                 ModResult::TableFull => panic!("need to handle TableFull by remove"),
                 _ => {}
-            }
-            Ok(match res.result {
-                ModResult::Replaced(v) => Some(v),
-                _ => None
-            })
+            };
+            Ok(retr)
         })
     }
 
@@ -684,7 +694,7 @@ pub trait Map<K, V> {
     fn with_capacity(cap: usize) -> Self;
     fn get(&self, key: K) -> Option<V>;
     fn insert(&self, key: K, value: V)-> Option<()> ;
-    fn remove(&self, key: K)-> Option<()> ;
+    fn remove(&self, key: K)-> Option<V> ;
 }
 
 pub struct ObjectMap<V: Copy> {
@@ -706,8 +716,8 @@ impl <V: Copy> Map<usize, V> for ObjectMap<V> {
         self.table.insert(key, !0, value).map(|_| ())
     }
 
-    fn remove(&self, key: usize) -> Option<()> {
-        self.table.remove(key).map(|_| ())
+    fn remove(&self, key: usize) -> Option<V> {
+        self.table.remove(key).map(|(_, v)| v)
     }
 }
 
@@ -730,7 +740,7 @@ impl Map<usize, usize> for WordMap {
         self.table.insert(key, value, ()).map(|_| ())
     }
 
-    fn remove(&self, key: usize) -> Option<()> {
-        self.table.remove(key,).map(|_| ())
+    fn remove(&self, key: usize) -> Option<usize> {
+        self.table.remove(key,).map(|(v, _)| v)
     }
 }
