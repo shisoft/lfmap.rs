@@ -113,7 +113,6 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                 ParsedValue::Sentinel => {
                     let old_chunk_base = chunk.base;
                     chunk = unsafe { Chunk::borrow(self.new_chunk.load(SeqCst)) };
-                    debug_assert_ne!(old_chunk_base, chunk.base);
                 }
                 ParsedValue::Empty => return None
             }
@@ -131,7 +130,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
             }
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
-            let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value, attached_val));
+            let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value & self.val_bit_mask, attached_val));
             let insertion_index = value_insertion.index;
             let mut result = None;
             match value_insertion.result {
@@ -150,9 +149,8 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
             }
             if copying {
                 debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
-                fence(Acquire);
+                fence(SeqCst);
                 self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
-                fence(Release);
             }
             new_chunk.occupation.fetch_add(1, Relaxed);
             Ok(result)
@@ -172,9 +170,8 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                 ModResult::Done(v) | ModResult::Replaced(v) => if copying {
                     retr = Some((v, new_chunk.attachment.get(res.index, key)));
                     debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
-                    fence(Acquire);
+                    fence(SeqCst);
                     self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
-                    fence(Release);
                     new_chunk.attachment.erase(res.index, key);
                 }
                 ModResult::NotFound => {
@@ -357,10 +354,11 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
 
     #[inline(always)]
     fn check_resize(&self, old_chunk_ptr: *mut Chunk<V, A>) -> bool {
-        let old_chunk_ins = unsafe { Chunk::borrow(old_chunk_ptr) };
-        let occupation = old_chunk_ins.occupation.load(Relaxed);
-        let occu_limit = old_chunk_ins.occu_limit;
-        if occupation > occu_limit {
+        {
+            let old_chunk_ins = unsafe { Chunk::borrow(old_chunk_ptr) };
+            let occupation = old_chunk_ins.occupation.load(Relaxed);
+            let occu_limit = old_chunk_ins.occu_limit;
+            if occupation <= occu_limit { return false; }
             // resize
             debug!("Resizing");
             let old_cap = old_chunk_ins.capacity;
@@ -412,7 +410,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                                 ModResult::TableFull => panic!()
                             };
                             if let Some(entry_addr) = inserted_addr {
-                                fence(Acquire);
+                                fence(SeqCst);
                                 // cas to ensure sentinel into old chunk
                                 if self.cas_value(old_address, value.raw, SENTINEL_VALUE) {
                                     // strip prime
@@ -424,10 +422,8 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
                                         effective_copy += 1;
                                     }
                                 } else {
-                                    fence(Release);
                                     continue; // retry this entry
                                 }
-                                fence(Release);
                             }
                             old_chunk_ins.attachment.erase(idx, key);
                         }
@@ -455,11 +451,10 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
             if self.old_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
                 panic!();
             }
-            unsafe { Chunk::mark_garbage(old_chunk_ptr); }
             debug!("{}", self.dump(new_base, new_cap));
-            return true;
         }
-        false
+        unsafe { Chunk::mark_garbage(old_chunk_ptr); }
+        true
     }
 
     fn dump(&self, base: usize, cap: usize) -> &str {
@@ -535,8 +530,10 @@ impl <V, A: Attachment<V>> Chunk <V, A> {
 
     unsafe fn mark_garbage(ptr: *mut Chunk<V, A>) {
         // Caller promise this chunk will not be reachable from the outside except snapshot in threads
-        let chunk = &*ptr;
-        chunk.refs.fetch_sub(1, Relaxed);
+        {
+            let chunk = &*ptr;
+            chunk.refs.fetch_sub(1, Relaxed);
+        }
         Self::check_gc(ptr);
     }
     unsafe fn check_gc(ptr: *mut Chunk<V, A>) {
@@ -559,9 +556,11 @@ impl ModOutput {
 
 impl <V, A: Attachment<V>>  Drop for ChunkRef<V, A> {
     fn drop(&mut self) {
-        if self.chunk as usize == 0 { return }
-        let chunk = unsafe { &*self.chunk };
-        chunk.refs.fetch_sub(1, Relaxed);
+        {
+            if self.chunk as usize == 0 { return }
+            let chunk = unsafe { &*self.chunk };
+            chunk.refs.fetch_sub(1, Relaxed);
+        }
         unsafe { Chunk::check_gc(self.chunk) }
     }
 }
