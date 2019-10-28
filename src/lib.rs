@@ -576,11 +576,8 @@ impl <V, A: Attachment<V>>  ChunkRef <V, A> {
     fn null_ref() -> Self { Self { ptr: 0 as *mut Chunk<V, A> } }
 }
 
-fn is_power_of_2(num: usize) -> bool {
-    if num < 1 {return false}
-    if num <= 2 {return true}
-    if num % 2 == 1 {return false};
-    return is_power_of_2(num / 2);
+fn is_power_of_2(x: usize) -> bool {
+    (x != 0) && ((x & (x - 1)) == 0)
 }
 
 #[inline(always)]
