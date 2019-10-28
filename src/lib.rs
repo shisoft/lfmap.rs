@@ -71,7 +71,7 @@ pub struct Chunk<V, A: Attachment<V>> {
 }
 
 pub struct ChunkRef<V, A: Attachment<V>> {
-    chunk: *mut Chunk<V, A>
+    ptr: *mut Chunk<V, A>
 }
 
 pub struct Table<V, A: Attachment<V>> {
@@ -124,12 +124,12 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
         let result = self.ensure_write_new(|new_chunk_ptr| {
             let old_chunk_ptr = self.old_chunk.load(Relaxed);
             let copying = new_chunk_ptr != old_chunk_ptr;
-            if !copying && self.check_resize(old_chunk_ptr) {
+            let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
+            if !copying && self.check_resize(&old_chunk) {
                 debug!("Resized, retry insertion key: {}, value {}", key, value);
                 return Err(self.insert(key, value, attached_val));
             }
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
-            let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
             let value_insertion = self.modify_entry(&*new_chunk, key, ModOp::Insert(value & self.val_bit_mask, attached_val));
             let insertion_index = value_insertion.index;
             let mut result = None;
@@ -353,108 +353,106 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
     }
 
     #[inline(always)]
-    fn check_resize(&self, old_chunk_ptr: *mut Chunk<V, A>) -> bool {
-        {
-            let old_chunk_ins = unsafe { Chunk::borrow(old_chunk_ptr) };
-            let occupation = old_chunk_ins.occupation.load(Relaxed);
-            let occu_limit = old_chunk_ins.occu_limit;
-            if occupation <= occu_limit { return false; }
-            // resize
-            debug!("Resizing");
-            let old_cap = old_chunk_ins.capacity;
-            let mult = if old_cap < 2048 { 4 } else { 1 };
-            let new_cap = old_cap << mult;
-            let new_chunk_ptr = Chunk::alloc_chunk(new_cap);
-            if self.new_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
-                // other thread have allocated new chunk and wins the competition, exit
-                unsafe { Chunk::mark_garbage(new_chunk_ptr); }
-                return true;
-            }
-            let new_chunk_ins = unsafe { Chunk::borrow(new_chunk_ptr) };
-            let new_base = new_chunk_ins.base;
-            let mut old_address = old_chunk_ins.base as usize;
-            let boundary = old_address + chunk_size_of(old_cap);
-            let mut effective_copy = 0;
-            let mut idx = 0;
-            while old_address < boundary  {
-                // iterate the old chunk to extract entries that is NOT empty
-                let key = self.get_key(old_address);
-                let value = self.get_value(old_address);
-                if key != EMPTY_KEY // Empty entry, skip
-                {
-                    // Reasoning value states
-                    match &value.parsed {
-                        ParsedValue::Val(v) => {
-                            // Insert entry into new chunk, in case of failure, skip this entry
-                            // Value should be primed
-                            debug!("Moving key: {}, value: {}", key, v);
-                            let primed_val = value.raw | self.inv_bit_mask;
-                            let attached_val = old_chunk_ins.attachment.get(idx, key);
-                            let new_chunk_insertion = self.modify_entry(
-                                &*new_chunk_ins,
-                                key,
-                                ModOp::AttemptInsert(primed_val, attached_val)
-                            );
-                            let inserted_addr = match new_chunk_insertion.result {
-                                ModResult::Done(addr) => Some(addr), // continue procedure
-                                ModResult::Fail(v) => None,
-                                ModResult::Replaced(_) => {
-                                    unreachable!("Attempt insert does not replace anything");
-                                }
-                                ModResult::Sentinel => {
-                                    unreachable!("New chunk should not have sentinel");
-                                }
-                                ModResult::NotFound => {
-                                    unreachable!()
-                                }
-                                ModResult::TableFull => panic!()
-                            };
-                            if let Some(entry_addr) = inserted_addr {
-                                fence(SeqCst);
-                                // cas to ensure sentinel into old chunk
-                                if self.cas_value(old_address, value.raw, SENTINEL_VALUE) {
-                                    // strip prime
-                                    let stripped = primed_val & self.val_bit_mask;
-                                    debug_assert_ne!(stripped, SENTINEL_VALUE);
-                                    if self.cas_value(entry_addr, primed_val, stripped) {
-                                        debug!("Effective copy key: {}, value {}, addr: {}",
-                                               key, stripped, entry_addr);
-                                        effective_copy += 1;
-                                    }
-                                } else {
-                                    continue; // retry this entry
-                                }
+    fn check_resize(&self, old_chunk_ref: &ChunkRef<V, A>) -> bool {
+        let old_chunk_ptr = old_chunk_ref.ptr;
+        let occupation = old_chunk_ref.occupation.load(Relaxed);
+        let occu_limit = old_chunk_ref.occu_limit;
+        if occupation <= occu_limit { return false; }
+        // resize
+        debug!("Resizing");
+        let old_cap = old_chunk_ref.capacity;
+        let mult = if old_cap < 2048 { 4 } else { 1 };
+        let new_cap = old_cap << mult;
+        let new_chunk_ptr = Chunk::alloc_chunk(new_cap);
+        if self.new_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
+            // other thread have allocated new chunk and wins the competition, exit
+            unsafe { Chunk::mark_garbage(new_chunk_ptr); }
+            return true;
+        }
+        let new_chunk_ins = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let new_base = new_chunk_ins.base;
+        let mut old_address = old_chunk_ref.base as usize;
+        let boundary = old_address + chunk_size_of(old_cap);
+        let mut effective_copy = 0;
+        let mut idx = 0;
+        while old_address < boundary  {
+            // iterate the old chunk to extract entries that is NOT empty
+            let key = self.get_key(old_address);
+            let value = self.get_value(old_address);
+            if key != EMPTY_KEY // Empty entry, skip
+            {
+                // Reasoning value states
+                match &value.parsed {
+                    ParsedValue::Val(v) => {
+                        // Insert entry into new chunk, in case of failure, skip this entry
+                        // Value should be primed
+                        debug!("Moving key: {}, value: {}", key, v);
+                        let primed_val = value.raw | self.inv_bit_mask;
+                        let attached_val = old_chunk_ref.attachment.get(idx, key);
+                        let new_chunk_insertion = self.modify_entry(
+                            &*new_chunk_ins,
+                            key,
+                            ModOp::AttemptInsert(primed_val, attached_val)
+                        );
+                        let inserted_addr = match new_chunk_insertion.result {
+                            ModResult::Done(addr) => Some(addr), // continue procedure
+                            ModResult::Fail(v) => None,
+                            ModResult::Replaced(_) => {
+                                unreachable!("Attempt insert does not replace anything");
                             }
-                            old_chunk_ins.attachment.erase(idx, key);
+                            ModResult::Sentinel => {
+                                unreachable!("New chunk should not have sentinel");
+                            }
+                            ModResult::NotFound => {
+                                unreachable!()
+                            }
+                            ModResult::TableFull => panic!()
+                        };
+                        if let Some(entry_addr) = inserted_addr {
+                            fence(SeqCst);
+                            // cas to ensure sentinel into old chunk
+                            if self.cas_value(old_address, value.raw, SENTINEL_VALUE) {
+                                // strip prime
+                                let stripped = primed_val & self.val_bit_mask;
+                                debug_assert_ne!(stripped, SENTINEL_VALUE);
+                                if self.cas_value(entry_addr, primed_val, stripped) {
+                                    debug!("Effective copy key: {}, value {}, addr: {}",
+                                           key, stripped, entry_addr);
+                                    effective_copy += 1;
+                                }
+                            } else {
+                                continue; // retry this entry
+                            }
                         }
-                        ParsedValue::Prime(v) => {
-                            // Should never have prime in old chunk
-                            panic!("Prime in old chunk when resizing")
-                        }
-                        ParsedValue::Sentinel => {
-                            // Sentinel, skip
-                            // Sentinel in old chunk implies its new value have already in the new chunk
-                            debug!("Skip copy sentinel");
-                        }
-                        ParsedValue::Empty => {
-                            // Empty, skip
-                            debug!("Skip copy empty, key: {}", key);
-                        }
+                        old_chunk_ref.attachment.erase(idx, key);
+                    }
+                    ParsedValue::Prime(v) => {
+                        // Should never have prime in old chunk
+                        panic!("Prime in old chunk when resizing")
+                    }
+                    ParsedValue::Sentinel => {
+                        // Sentinel, skip
+                        // Sentinel in old chunk implies its new value have already in the new chunk
+                        debug!("Skip copy sentinel");
+                    }
+                    ParsedValue::Empty => {
+                        // Empty, skip
+                        debug!("Skip copy empty, key: {}", key);
                     }
                 }
-                old_address += entry_size();
-                idx += 1;
             }
-            // resize finished, make changes on the numbers
-            new_chunk_ins.occupation.fetch_add(effective_copy, Relaxed);
-            debug_assert_ne!(old_chunk_ptr as usize, new_base);
-            if self.old_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
-                panic!();
-            }
-            debug!("{}", self.dump(new_base, new_cap));
+            old_address += entry_size();
+            idx += 1;
         }
+        // resize finished, make changes on the numbers
+        new_chunk_ins.occupation.fetch_add(effective_copy, Relaxed);
+        debug_assert_ne!(old_chunk_ptr as usize, new_base);
+        if self.old_chunk.compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst) != old_chunk_ptr {
+            panic!();
+        }
+        debug!("{}", self.dump(new_base, new_cap));
         unsafe { Chunk::mark_garbage(old_chunk_ptr); }
-        true
+        return true;
     }
 
     fn dump(&self, base: usize, cap: usize) -> &str {
@@ -520,7 +518,7 @@ impl <V, A: Attachment<V>> Chunk <V, A> {
         let chunk = &*ptr;
         chunk.refs.fetch_add(1, Relaxed);
         ChunkRef {
-            chunk: ptr
+            ptr: ptr
         }
     }
 
@@ -557,11 +555,11 @@ impl ModOutput {
 impl <V, A: Attachment<V>>  Drop for ChunkRef<V, A> {
     fn drop(&mut self) {
         {
-            if self.chunk as usize == 0 { return }
-            let chunk = unsafe { &*self.chunk };
+            if self.ptr as usize == 0 { return }
+            let chunk = unsafe { &*self.ptr };
             chunk.refs.fetch_sub(1, Relaxed);
         }
-        unsafe { Chunk::check_gc(self.chunk) }
+        unsafe { Chunk::check_gc(self.ptr) }
     }
 }
 
@@ -569,13 +567,13 @@ impl <V, A: Attachment<V>>  Deref for ChunkRef<V, A> {
     type Target = Chunk<V, A>;
 
     fn deref(&self) -> &Self::Target {
-        debug_assert_ne!(self.chunk as usize, 0);
-        unsafe { &*self.chunk }
+        debug_assert_ne!(self.ptr as usize, 0);
+        unsafe { &*self.ptr }
     }
 }
 
 impl <V, A: Attachment<V>>  ChunkRef <V, A> {
-    fn null_ref() -> Self { Self { chunk: 0 as *mut Chunk<V, A> } }
+    fn null_ref() -> Self { Self { ptr: 0 as *mut Chunk<V, A> } }
 }
 
 fn is_power_of_2(num: usize) -> bool {
