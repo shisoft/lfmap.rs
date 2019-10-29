@@ -465,7 +465,7 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
     }
 }
 
-impl <V: Copy, A: Attachment<V>> Drop for Table <V, A> {
+impl <V, A: Attachment<V>> Drop for Table <V, A> {
     fn drop(&mut self) {
         let old_chunk = self.old_chunk.load(Relaxed);
         let new_chunk = self.new_chunk.load(Relaxed);
