@@ -16,7 +16,7 @@ fn will_not_overflow() {
 }
 
 #[test]
-fn resize () {
+fn resize() {
     env_logger::try_init();
     let map = WordMap::with_capacity(16);
     for i in 5..2048 {
@@ -25,7 +25,7 @@ fn resize () {
     for i in 5..2048 {
         match map.get(i) {
             Some(r) => assert_eq!(r, i * 2),
-            None => panic!("{}", i)
+            None => panic!("{}", i),
         }
     }
 }
@@ -40,13 +40,11 @@ fn parallel_no_resize() {
     }
     for i in 100..900 {
         let map = map.clone();
-        threads.push(
-            thread::spawn(move || {
-                for j in 5..60 {
-                    map.insert(i * 100 + j, i * j);
-                }
-            })
-        );
+        threads.push(thread::spawn(move || {
+            for j in 5..60 {
+                map.insert(i * 100 + j, i * j);
+            }
+        }));
     }
     for i in 5..9 {
         for j in 1..10 {
@@ -74,14 +72,11 @@ fn parallel_with_resize() {
     let mut threads = vec![];
     for i in 5..24 {
         let map = map.clone();
-        threads.push(
-            thread::spawn(move || {
-                for j in 5..1000 {
-                    map.insert(i + j * 100, i * j);
-                }
-
-            })
-        );
+        threads.push(thread::spawn(move || {
+            for j in 5..1000 {
+                map.insert(i + j * 100, i * j);
+            }
+        }));
     }
     for thread in threads {
         let _ = thread.join();
@@ -91,91 +86,81 @@ fn parallel_with_resize() {
             let k = i + j * 100;
             match map.get(k) {
                 Some(v) => assert_eq!(v, i * j),
-                None => {
-                    panic!("Value should not be None for key: {}", k)
-                }
+                None => panic!("Value should not be None for key: {}", k),
             }
         }
     }
 }
 
-    #[test]
-    fn parallel_hybird() {
-        let map = Arc::new(WordMap::with_capacity(32));
-        for i in 5..128 {
-            map.insert(i, i * 10);
-        }
-        let mut threads = vec![];
-        for i in 256..265 {
-            let map = map.clone();
-            threads.push(
-                thread::spawn(move || {
-                    for j in 5..60 {
-                        map.insert(i * 10 + j , 10);
-                    }
-
-                })
-            );
-        }
-        for i in 5..8 {
-            let map = map.clone();
-            threads.push(
-                thread::spawn(move || {
-                    for j in 5..8 {
-                        map.remove(i * j);
-                    }
-                })
-            );
-        }
-        for thread in threads {
-            let _ = thread.join();
-        }
-        for i in 256..265 {
+#[test]
+fn parallel_hybird() {
+    let map = Arc::new(WordMap::with_capacity(32));
+    for i in 5..128 {
+        map.insert(i, i * 10);
+    }
+    let mut threads = vec![];
+    for i in 256..265 {
+        let map = map.clone();
+        threads.push(thread::spawn(move || {
             for j in 5..60 {
-                assert_eq!(map.get(i * 10 + j), Some(10))
+                map.insert(i * 10 + j, 10);
             }
+        }));
+    }
+    for i in 5..8 {
+        let map = map.clone();
+        threads.push(thread::spawn(move || {
+            for j in 5..8 {
+                map.remove(i * j);
+            }
+        }));
+    }
+    for thread in threads {
+        let _ = thread.join();
+    }
+    for i in 256..265 {
+        for j in 5..60 {
+            assert_eq!(map.get(i * 10 + j), Some(10))
         }
     }
+}
 
-
-    #[test]
-    fn obj_map() {
-        #[derive(Copy, Clone)]
-        struct Obj {
-            a: usize,
-            b: usize,
-            c: usize,
-            d: usize
-        }
-        impl Obj {
-            fn new(num: usize) -> Self {
-                Obj {
-                    a: num,
-                    b: num + 1,
-                    c: num + 2,
-                    d: num + 3
-                }
-            }
-            fn validate(&self, num: usize) {
-                assert_eq!(self.a, num);
-                assert_eq!(self.b, num + 1);
-                assert_eq!(self.c, num + 2);
-                assert_eq!(self.d, num + 3);
+#[test]
+fn obj_map() {
+    #[derive(Copy, Clone)]
+    struct Obj {
+        a: usize,
+        b: usize,
+        c: usize,
+        d: usize,
+    }
+    impl Obj {
+        fn new(num: usize) -> Self {
+            Obj {
+                a: num,
+                b: num + 1,
+                c: num + 2,
+                d: num + 3,
             }
         }
-        let map = ObjectMap::with_capacity(16);
-        for i in 5..2048 {
-            map.insert(i, Obj::new(i));
-        }
-        for i in 5..2048 {
-            match map.get(i) {
-                Some(r) => {
-                    r.validate(i)
-                },
-                None => panic!("{}", i)
-            }
+        fn validate(&self, num: usize) {
+            assert_eq!(self.a, num);
+            assert_eq!(self.b, num + 1);
+            assert_eq!(self.c, num + 2);
+            assert_eq!(self.d, num + 3);
         }
     }
+    let map = ObjectMap::with_capacity(16);
+    for i in 5..2048 {
+        map.insert(i, Obj::new(i));
+    }
+    for i in 5..2048 {
+        match map.get(i) {
+            Some(r) => r.validate(i),
+            None => panic!("{}", i),
+        }
+    }
+}
 
 //#![feature(core_intrinsics)]
 //#![feature(test)]
