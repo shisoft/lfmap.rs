@@ -606,21 +606,6 @@ fn chunk_size_of(cap: usize) -> usize {
     cap * entry_size()
 }
 
-#[inline(always)]
-fn alloc_mem(size: usize) -> usize {
-    let align = mem::align_of::<EntryTemplate>();
-    let layout = Layout::from_size_align(size, align).unwrap();
-    // must be all zeroed
-    unsafe { Global.alloc_zeroed(layout) }.unwrap().as_ptr() as usize
-}
-
-#[inline(always)]
-fn dealloc_mem(ptr: usize, size: usize) {
-    let align = mem::align_of::<EntryTemplate>();
-    let layout = Layout::from_size_align(size, align).unwrap();
-    unsafe { Global.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
-}
-
 pub trait Attachment<V> {
     fn new(cap: usize) -> Self;
     fn get(&self, index: usize, key: usize) -> V;
@@ -744,4 +729,19 @@ impl Map<usize, usize> for WordMap {
     fn remove(&self, key: usize) -> Option<usize> {
         self.table.remove(key,).map(|(v, _)| v)
     }
+}
+
+#[inline(always)]
+fn alloc_mem(size: usize) -> usize {
+    let align = mem::align_of::<EntryTemplate>();
+    let layout = Layout::from_size_align(size, align).unwrap();
+    // must be all zeroed
+    unsafe { Global.alloc_zeroed(layout) }.unwrap().as_ptr() as usize
+}
+
+#[inline(always)]
+fn dealloc_mem(ptr: usize, size: usize) {
+    let align = mem::align_of::<EntryTemplate>();
+    let layout = Layout::from_size_align(size, align).unwrap();
+    unsafe { Global.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
 }
