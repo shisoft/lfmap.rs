@@ -463,8 +463,19 @@ impl <V: Copy, A: Attachment<V>> Table <V, A> {
         }
         "DUMPED"
     }
+}
 
-
+impl <V: Copy, A: Attachment<V>> Drop for Table <V, A> {
+    fn drop(&mut self) {
+        let old_chunk = self.old_chunk.load(Relaxed);
+        let new_chunk = self.new_chunk.load(Relaxed);
+        unsafe {
+            Chunk::mark_garbage(old_chunk);
+            if old_chunk != new_chunk {
+                Chunk::mark_garbage(new_chunk);
+            }
+        }
+    }
 }
 
 impl Value {
