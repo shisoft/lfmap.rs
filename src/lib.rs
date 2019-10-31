@@ -338,6 +338,44 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
         }
     }
 
+    fn all_from_chunk(&self, chunk: &Chunk<V, A>) -> Vec<(usize, usize, V)> {
+        let mut idx = 0;
+        let entry_size = mem::size_of::<EntryTemplate>();
+        let cap = chunk.capacity;
+        let base = chunk.base;
+        let mut counter = 0;
+        let mut res = vec![];
+        while counter < cap {
+            idx &= (cap - 1);
+            let addr = base + idx * entry_size;
+            let k = self.get_key(addr);
+            if k != EMPTY_KEY {
+                let val_res = self.get_value(addr);
+                match val_res.parsed {
+                    ParsedValue::Val(v) | ParsedValue::Prime(v) => {
+                        res.push((k, v, chunk.attachment.get(idx, k)))
+                    }
+                    _ => {},
+                }
+            }
+            idx += 1; // reprobe
+            counter += 1;
+        }
+        return res;
+    }
+
+    fn entries(&self) -> Vec<(usize, usize, V)> {
+        let old_chunk_ptr = self.old_chunk.load(Relaxed);
+        let new_chunk_ptr = self.new_chunk.load(Relaxed);
+        let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
+        let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let mut res = self.all_from_chunk(&*old_chunk);
+        if old_chunk_ptr != new_chunk_ptr {
+            res.append(&mut self.all_from_chunk(&*new_chunk));
+        }
+        return res;
+    }
+
     #[inline(always)]
     fn get_key(&self, entry_addr: usize) -> usize {
         unsafe { intrinsics::atomic_load_relaxed(entry_addr as *mut usize) }
@@ -732,6 +770,7 @@ pub trait Map<K, V> {
     fn get(&self, key: K) -> Option<V>;
     fn insert(&self, key: K, value: V) -> Option<()>;
     fn remove(&self, key: K) -> Option<V>;
+    fn entries(&self) -> Vec<(usize, V)>;
 }
 
 pub struct ObjectMap<V: Clone> {
@@ -756,6 +795,10 @@ impl<V: Clone> Map<usize, V> for ObjectMap<V> {
     fn remove(&self, key: usize) -> Option<V> {
         self.table.remove(key).map(|(_, v)| v)
     }
+
+    fn entries(&self) -> Vec<(usize, V)> {
+        self.table.entries().into_iter().map(|(k, _, v)| (k, v)).collect()
+    }
 }
 
 pub struct WordMap {
@@ -779,6 +822,9 @@ impl Map<usize, usize> for WordMap {
 
     fn remove(&self, key: usize) -> Option<usize> {
         self.table.remove(key).map(|(v, _)| v)
+    }
+    fn entries(&self) -> Vec<(usize, usize)> {
+        self.table.entries().into_iter().map(|(k, v, _)| (k, v)).collect()
     }
 }
 
