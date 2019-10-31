@@ -1,4 +1,3 @@
-#![no_std]
 #![feature(allocator_api)]
 #![feature(core_intrinsics)]
 extern crate alloc;
@@ -17,6 +16,7 @@ use core::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
 use core::{intrinsics, mem, ptr};
 use ModOp::Empty;
+use std::ptr::drop_in_place;
 
 pub type EntryTemplate = (usize, usize);
 
@@ -81,7 +81,7 @@ pub struct Table<V, A: Attachment<V>> {
     inv_bit_mask: usize, // 1000000..
 }
 
-impl<V: Copy, A: Attachment<V>> Table<V, A> {
+impl<V: Clone, A: Attachment<V>> Table<V, A> {
     pub fn with_capacity(cap: usize) -> Self {
         if !is_power_of_2(cap) {
             panic!("capacity is not power of 2");
@@ -127,13 +127,13 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
             let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
             if !copying && self.check_resize(&old_chunk) {
                 debug!("Resized, retry insertion key: {}, value {}", key, value);
-                return Err(self.insert(key, value, attached_val));
+                return Err(self.insert(key, value, attached_val.clone()));
             }
             let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
             let value_insertion = self.modify_entry(
                 &*new_chunk,
                 key,
-                ModOp::Insert(value & self.val_bit_mask, attached_val),
+                ModOp::Insert(value & self.val_bit_mask, attached_val.clone()),
             );
             let insertion_index = value_insertion.index;
             let mut result = None;
@@ -175,7 +175,6 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
                         debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
                         fence(SeqCst);
                         self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
-                        new_chunk.attachment.erase(res.index, key);
                     }
                 }
                 ModResult::NotFound => {
@@ -183,7 +182,6 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
                     match remove_from_old.result {
                         ModResult::Done(v) | ModResult::Replaced(v) => {
                             retr = Some((v, new_chunk.attachment.get(res.index, key)));
-                            old_chunk.attachment.erase(res.index, key);
                         }
                         _ => {}
                     }
@@ -260,6 +258,7 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
                         match op {
                             ModOp::Sentinel => {
                                 self.set_sentinel(addr);
+                                chunk.attachment.erase(idx, key);
                                 return ModOutput::new(ModResult::Done(addr), idx);
                             }
                             ModOp::Empty | ModOp::Insert(_, _) => {
@@ -270,6 +269,7 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
                                     return ModOutput::new(ModResult::Fail(*v), idx);
                                 } else {
                                     // we have put tombstone on the value
+                                    chunk.attachment.erase(idx, key);
                                     replaced = Some(*v);
                                 }
                             }
@@ -308,7 +308,7 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
                     }
                 };
                 let mod_res = match op {
-                    ModOp::Insert(val, attach_val) | ModOp::AttemptInsert(val, attach_val) => {
+                    ModOp::Insert(val, ref attach_val) | ModOp::AttemptInsert(val, ref attach_val) => {
                         debug!(
                             "Inserting entry key: {}, value: {}, raw: {:b}, addr: {}",
                             key,
@@ -316,7 +316,7 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
                             val,
                             addr
                         );
-                        put_in_empty(val, Some(attach_val))
+                        put_in_empty(val, Some(attach_val.clone()))
                     }
                     ModOp::Sentinel => put_in_empty(SENTINEL_VALUE, None),
                     ModOp::Empty => return ModOutput::new(ModResult::Fail(0), idx),
@@ -442,13 +442,13 @@ impl<V: Copy, A: Attachment<V>> Table<V, A> {
                                         "Effective copy key: {}, value {}, addr: {}",
                                         key, stripped, entry_addr
                                     );
+                                    old_chunk_ref.attachment.erase(idx, key);
                                     effective_copy += 1;
                                 }
                             } else {
                                 continue; // retry this entry
                             }
                         }
-                        old_chunk_ref.attachment.erase(idx, key);
                     }
                     ParsedValue::Prime(v) => {
                         // Should never have prime in old chunk
@@ -687,7 +687,7 @@ pub struct ObjectAttachment<T> {
     shadow: PhantomData<T>,
 }
 
-impl<T: Copy> Attachment<T> for ObjectAttachment<T> {
+impl<T: Clone> Attachment<T> for ObjectAttachment<T> {
     fn new(cap: usize) -> Self {
         let obj_size = mem::size_of::<T>();
         let obj_chunk_size = cap * obj_size;
@@ -702,7 +702,7 @@ impl<T: Copy> Attachment<T> for ObjectAttachment<T> {
 
     fn get(&self, index: usize, key: usize) -> T {
         let addr = self.addr_by_index(index);
-        unsafe { *(addr as *mut T) }
+        unsafe { (*(addr as *mut T)).clone() }
     }
 
     fn set(&self, index: usize, key: usize, att_value: T) {
@@ -711,7 +711,9 @@ impl<T: Copy> Attachment<T> for ObjectAttachment<T> {
     }
 
     fn erase(&self, index: usize, key: usize) {
-        // will not erase
+        unsafe {
+            drop(self.addr_by_index(index) as *mut T)
+        }
     }
 
     fn dealloc(&self) {
@@ -732,11 +734,11 @@ pub trait Map<K, V> {
     fn remove(&self, key: K) -> Option<V>;
 }
 
-pub struct ObjectMap<V: Copy> {
+pub struct ObjectMap<V: Clone> {
     table: Table<V, ObjectAttachment<V>>,
 }
 
-impl<V: Copy> Map<usize, V> for ObjectMap<V> {
+impl<V: Clone> Map<usize, V> for ObjectMap<V> {
     fn with_capacity(cap: usize) -> Self {
         Self {
             table: Table::with_capacity(cap),
