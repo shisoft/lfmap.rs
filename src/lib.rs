@@ -15,8 +15,8 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
 use core::{intrinsics, mem, ptr};
-use ModOp::Empty;
 use std::ptr::drop_in_place;
+use ModOp::Empty;
 
 pub type EntryTemplate = (usize, usize);
 
@@ -102,13 +102,20 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
         Self::with_capacity(64)
     }
 
-    pub fn get(&self, key: usize) -> Option<(usize, V)> {
+    pub fn get(&self, key: usize, read_attachment: bool) -> Option<(usize, Option<V>)> {
         let mut chunk = unsafe { Chunk::borrow(self.old_chunk.load(SeqCst)) };
         loop {
             let (val, idx) = self.get_from_chunk(&*chunk, key);
             match val.parsed {
                 ParsedValue::Prime(val) | ParsedValue::Val(val) => {
-                    return Some((val, chunk.attachment.get(idx, key)))
+                    return Some((
+                        val,
+                        if read_attachment {
+                            Some(chunk.attachment.get(idx, key))
+                        } else {
+                            None
+                        },
+                    ))
                 }
                 ParsedValue::Sentinel => {
                     let old_chunk_base = chunk.base;
@@ -308,7 +315,8 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
                     }
                 };
                 let mod_res = match op {
-                    ModOp::Insert(val, ref attach_val) | ModOp::AttemptInsert(val, ref attach_val) => {
+                    ModOp::Insert(val, ref attach_val)
+                    | ModOp::AttemptInsert(val, ref attach_val) => {
                         debug!(
                             "Inserting entry key: {}, value: {}, raw: {:b}, addr: {}",
                             key,
@@ -355,7 +363,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
                     ParsedValue::Val(v) | ParsedValue::Prime(v) => {
                         res.push((k, v, chunk.attachment.get(idx, k)))
                     }
-                    _ => {},
+                    _ => {}
                 }
             }
             idx += 1; // reprobe
@@ -749,9 +757,7 @@ impl<T: Clone> Attachment<T> for ObjectAttachment<T> {
     }
 
     fn erase(&self, index: usize, key: usize) {
-        unsafe {
-            drop(self.addr_by_index(index) as *mut T)
-        }
+        unsafe { drop(self.addr_by_index(index) as *mut T) }
     }
 
     fn dealloc(&self) {
@@ -771,6 +777,7 @@ pub trait Map<K, V> {
     fn insert(&self, key: K, value: V) -> Option<()>;
     fn remove(&self, key: K) -> Option<V>;
     fn entries(&self) -> Vec<(usize, V)>;
+    fn contains(&self, key: K) -> bool;
 }
 
 pub struct ObjectMap<V: Clone> {
@@ -785,7 +792,7 @@ impl<V: Clone> Map<usize, V> for ObjectMap<V> {
     }
 
     fn get(&self, key: usize) -> Option<V> {
-        self.table.get(key).map(|v| v.1)
+        self.table.get(key, true).map(|v| v.1.unwrap())
     }
 
     fn insert(&self, key: usize, value: V) -> Option<()> {
@@ -797,7 +804,15 @@ impl<V: Clone> Map<usize, V> for ObjectMap<V> {
     }
 
     fn entries(&self) -> Vec<(usize, V)> {
-        self.table.entries().into_iter().map(|(k, _, v)| (k, v)).collect()
+        self.table
+            .entries()
+            .into_iter()
+            .map(|(k, _, v)| (k, v))
+            .collect()
+    }
+
+    fn contains(&self, key: usize) -> bool {
+        self.table.get(key, false).is_some()
     }
 }
 
@@ -813,7 +828,7 @@ impl Map<usize, usize> for WordMap {
     }
 
     fn get(&self, key: usize) -> Option<usize> {
-        self.table.get(key).map(|v| v.0)
+        self.table.get(key, false).map(|v| v.0)
     }
 
     fn insert(&self, key: usize, value: usize) -> Option<()> {
@@ -824,7 +839,15 @@ impl Map<usize, usize> for WordMap {
         self.table.remove(key).map(|(v, _)| v)
     }
     fn entries(&self) -> Vec<(usize, usize)> {
-        self.table.entries().into_iter().map(|(k, v, _)| (k, v)).collect()
+        self.table
+            .entries()
+            .into_iter()
+            .map(|(k, v, _)| (k, v))
+            .collect()
+    }
+
+    fn contains(&self, key: usize) -> bool {
+        self.get(key).is_some()
     }
 }
 
