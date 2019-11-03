@@ -784,6 +784,8 @@ pub trait Map<K, V> {
     fn contains(&self, key: K) -> bool;
 }
 
+const NUM_KEY_FIX: usize = 5;
+
 pub struct ObjectMap<V: Clone> {
     table: Table<V, ObjectAttachment<V>>,
 }
@@ -796,27 +798,27 @@ impl<V: Clone> Map<usize, V> for ObjectMap<V> {
     }
 
     fn get(&self, key: usize) -> Option<V> {
-        self.table.get(key, true).map(|v| v.1.unwrap())
+        self.table.get(key + NUM_KEY_FIX, true).map(|v| v.1.unwrap())
     }
 
     fn insert(&self, key: usize, value: V) -> Option<()> {
-        self.table.insert(key, !0, value).map(|_| ())
+        self.table.insert(key + NUM_KEY_FIX, !0, value).map(|_| ())
     }
 
     fn remove(&self, key: usize) -> Option<V> {
-        self.table.remove(key).map(|(_, v)| v)
+        self.table.remove(key + NUM_KEY_FIX).map(|(_, v)| v)
     }
 
     fn entries(&self) -> Vec<(usize, V)> {
         self.table
             .entries()
             .into_iter()
-            .map(|(k, _, v)| (k, v))
+            .map(|(k, _, v)| (k - NUM_KEY_FIX, v))
             .collect()
     }
 
     fn contains(&self, key: usize) -> bool {
-        self.table.get(key, false).is_some()
+        self.table.get(key + NUM_KEY_FIX, false).is_some()
     }
 }
 
@@ -832,11 +834,11 @@ impl Map<usize, usize> for WordMap {
     }
 
     fn get(&self, key: usize) -> Option<usize> {
-        self.table.get(key, false).map(|v| v.0)
+        self.table.get(key + NUM_KEY_FIX, false).map(|v| v.0)
     }
 
     fn insert(&self, key: usize, value: usize) -> Option<()> {
-        self.table.insert(key, value, ()).map(|_| ())
+        self.table.insert(key + NUM_KEY_FIX, value, ()).map(|_| ())
     }
 
     fn remove(&self, key: usize) -> Option<usize> {
@@ -846,7 +848,7 @@ impl Map<usize, usize> for WordMap {
         self.table
             .entries()
             .into_iter()
-            .map(|(k, v, _)| (k, v))
+            .map(|(k, v, _)| (k - NUM_KEY_FIX, v))
             .collect()
     }
 
