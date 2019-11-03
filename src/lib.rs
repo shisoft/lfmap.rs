@@ -15,7 +15,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
 use core::{intrinsics, mem, ptr};
-use std::ptr::drop_in_place;
+use std::ptr::{drop_in_place, null, null_mut};
 use ModOp::Empty;
 
 pub type EntryTemplate = (usize, usize);
@@ -548,8 +548,10 @@ impl<V, A: Attachment<V>> Drop for Table<V, A> {
         let old_chunk = self.old_chunk.load(Relaxed);
         let new_chunk = self.new_chunk.load(Relaxed);
         unsafe {
-            Chunk::mark_garbage(old_chunk);
-            if old_chunk != new_chunk {
+            if old_chunk != null_mut() {
+                Chunk::mark_garbage(old_chunk);
+            }
+            if old_chunk != new_chunk  && new_chunk != null_mut() {
                 Chunk::mark_garbage(new_chunk);
             }
         }
