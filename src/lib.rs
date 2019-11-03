@@ -148,7 +148,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
                 ModResult::Done(_) => {}
                 ModResult::Replaced(v) | ModResult::Fail(v) => result = Some(v),
                 ModResult::TableFull => {
-                    panic!("Insertion is too fast");
+                    panic!("Insertion is too fast, copying {}, cap {}", copying, new_chunk.capacity);
                 }
                 ModResult::Sentinel => {
                     debug!("Insert new and see sentinel, abort");
