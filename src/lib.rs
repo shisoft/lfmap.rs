@@ -842,7 +842,7 @@ impl Map<usize, usize> for WordMap {
     }
 
     fn remove(&self, key: usize) -> Option<usize> {
-        self.table.remove(key).map(|(v, _)| v)
+        self.table.remove(key + NUM_KEY_FIX).map(|(v, _)| v)
     }
     fn entries(&self) -> Vec<(usize, usize)> {
         self.table
