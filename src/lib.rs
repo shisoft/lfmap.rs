@@ -637,7 +637,7 @@ impl<V, A: Attachment<V>> Chunk<V, A> {
     }
     unsafe fn check_gc(ptr: *mut Chunk<V, A>) {
         let chunk = &*ptr;
-        if chunk.refs.compare_and_swap(0, core::usize::MAX, Relaxed) == 0 {
+        if chunk.refs.load(Relaxed) == 0 && chunk.refs.compare_and_swap(0, core::usize::MAX, Relaxed) == 0 {
             chunk.attachment.dealloc();
             dealloc_mem(ptr as usize, mem::size_of::<Self>());
             dealloc_mem(chunk.base, chunk_size_of(chunk.capacity));
