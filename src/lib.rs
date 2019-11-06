@@ -826,7 +826,7 @@ pub struct WordMap<ALLOC: Alloc + Default = Global> {
     table: WordTable<ALLOC>,
 }
 
-impl Map <usize, usize> for WordMap {
+impl <ALLOC: Alloc + Default> Map <usize, usize> for WordMap<ALLOC> {
     fn with_capacity(cap: usize) -> Self {
         Self {
             table: Table::with_capacity(cap),
