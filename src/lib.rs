@@ -790,7 +790,7 @@ pub struct ObjectMap<V: Clone, ALLOC: Alloc + Default = Global> {
     table: Table<V, ObjectAttachment<V, ALLOC>, ALLOC>,
 }
 
-impl<V: Clone> Map<usize, V> for ObjectMap<V> {
+impl<V: Clone, ALLOC: Alloc + Default> Map<usize, V> for ObjectMap<V, ALLOC> {
     fn with_capacity(cap: usize) -> Self {
         Self {
             table: Table::with_capacity(cap),
