@@ -6,7 +6,7 @@ extern crate log;
 // usize to usize lock-free, wait free table
 use alloc::alloc::Global;
 use alloc::string::String;
-use core::alloc::{Alloc, Layout};
+use core::alloc::{Alloc, Layout, GlobalAlloc};
 use core::cmp::Ordering;
 use core::iter::Copied;
 use core::marker::PhantomData;
@@ -59,7 +59,7 @@ enum ModOp<T> {
     Empty,
 }
 
-pub struct Chunk<V, A: Attachment<V>> {
+pub struct Chunk<V, A: Attachment<V>, ALLOC: Alloc + Default> {
     capacity: usize,
     base: usize,
     // floating-point multiplication is slow, cache this value and recompute every time when resize
@@ -67,21 +67,21 @@ pub struct Chunk<V, A: Attachment<V>> {
     occupation: AtomicUsize,
     refs: AtomicUsize,
     attachment: A,
-    shadow: PhantomData<V>,
+    shadow: PhantomData<(V, ALLOC)>,
 }
 
-pub struct ChunkRef<V, A: Attachment<V>> {
-    ptr: *mut Chunk<V, A>,
+pub struct ChunkRef<V, A: Attachment<V>, ALLOC: Alloc + Default> {
+    ptr: *mut Chunk<V, A, ALLOC>,
 }
 
-pub struct Table<V, A: Attachment<V>> {
-    old_chunk: AtomicPtr<Chunk<V, A>>,
-    new_chunk: AtomicPtr<Chunk<V, A>>,
+pub struct Table<V, A: Attachment<V>, ALLOC: Alloc + Default> {
+    old_chunk: AtomicPtr<Chunk<V, A, ALLOC>>,
+    new_chunk: AtomicPtr<Chunk<V, A, ALLOC>>,
     val_bit_mask: usize, // 0111111..
     inv_bit_mask: usize, // 1000000..
 }
 
-impl<V: Clone, A: Attachment<V>> Table<V, A> {
+impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     pub fn with_capacity(cap: usize) -> Self {
         if !is_power_of_2(cap) {
             panic!("capacity is not power of 2");
@@ -205,7 +205,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
 
     fn ensure_write_new<R, F>(&self, f: F) -> R
     where
-        F: Fn(*mut Chunk<V, A>) -> Result<R, R>,
+        F: Fn(*mut Chunk<V, A, ALLOC>) -> Result<R, R>,
     {
         loop {
             let new_chunk_ptr = self.new_chunk.load(SeqCst);
@@ -220,7 +220,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
         }
     }
 
-    fn get_from_chunk(&self, chunk: &Chunk<V, A>, key: usize) -> (Value, usize) {
+    fn get_from_chunk(&self, chunk: &Chunk<V, A, ALLOC>, key: usize) -> (Value, usize) {
         let mut idx = key;
         let entry_size = mem::size_of::<EntryTemplate>();
         let cap = chunk.capacity;
@@ -248,7 +248,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
         return (Value::new(0, self), 0);
     }
 
-    fn modify_entry(&self, chunk: &Chunk<V, A>, key: usize, op: ModOp<V>) -> ModOutput {
+    fn modify_entry(&self, chunk: &Chunk<V, A, ALLOC>, key: usize, op: ModOp<V>) -> ModOutput {
         let cap = chunk.capacity;
         let base = chunk.base;
         let mut idx = key;
@@ -348,7 +348,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
         }
     }
 
-    fn all_from_chunk(&self, chunk: &Chunk<V, A>) -> Vec<(usize, usize, V)> {
+    fn all_from_chunk(&self, chunk: &Chunk<V, A, ALLOC>) -> Vec<(usize, usize, V)> {
         let mut idx = 0;
         let entry_size = mem::size_of::<EntryTemplate>();
         let cap = chunk.capacity;
@@ -416,7 +416,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
     }
 
     #[inline(always)]
-    fn check_resize(&self, old_chunk_ref: &ChunkRef<V, A>) -> bool {
+    fn check_resize(&self, old_chunk_ref: &ChunkRef<V, A, ALLOC>) -> bool {
         let old_chunk_ptr = old_chunk_ref.ptr;
         let occupation = old_chunk_ref.occupation.load(Relaxed);
         let occu_limit = old_chunk_ref.occu_limit;
@@ -545,7 +545,7 @@ impl<V: Clone, A: Attachment<V>> Table<V, A> {
     }
 }
 
-impl<V, A: Attachment<V>> Drop for Table<V, A> {
+impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for Table<V, A, ALLOC> {
     fn drop(&mut self) {
         let old_chunk = self.old_chunk.load(Relaxed);
         let new_chunk = self.new_chunk.load(Relaxed);
@@ -561,7 +561,7 @@ impl<V, A: Attachment<V>> Drop for Table<V, A> {
 }
 
 impl Value {
-    pub fn new<V, A: Attachment<V>>(val: usize, table: &Table<V, A>) -> Self {
+    pub fn new<V, A: Attachment<V>, ALLOC: Alloc + Default>(val: usize, table: &Table<V, A, ALLOC>) -> Self {
         let res = {
             if val == 0 {
                 ParsedValue::Empty
@@ -593,10 +593,10 @@ impl ParsedValue {
     }
 }
 
-impl<V, A: Attachment<V>> Chunk<V, A> {
+impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
     fn alloc_chunk(capacity: usize) -> *mut Self {
-        let base = alloc_mem(chunk_size_of(capacity));
-        let ptr = alloc_mem(mem::size_of::<Self>()) as *mut Self;
+        let base = alloc_mem::<ALLOC>(chunk_size_of(capacity));
+        let ptr = alloc_mem::<ALLOC>(mem::size_of::<Self>()) as *mut Self;
         unsafe {
             ptr::write(
                 ptr,
@@ -613,13 +613,13 @@ impl<V, A: Attachment<V>> Chunk<V, A> {
         };
         ptr
     }
-    unsafe fn borrow(ptr: *mut Chunk<V, A>) -> ChunkRef<V, A> {
+    unsafe fn borrow(ptr: *mut Chunk<V, A, ALLOC>) -> ChunkRef<V, A, ALLOC> {
         let chunk = &*ptr;
         chunk.refs.fetch_add(1, Relaxed);
         ChunkRef { ptr: ptr }
     }
 
-    unsafe fn borrow_if_cond(ptr: *mut Chunk<V, A>, cond: bool) -> ChunkRef<V, A> {
+    unsafe fn borrow_if_cond(ptr: *mut Chunk<V, A, ALLOC>, cond: bool) -> ChunkRef<V, A, ALLOC> {
         if cond {
             unsafe { Chunk::borrow(ptr) }
         } else {
@@ -627,7 +627,7 @@ impl<V, A: Attachment<V>> Chunk<V, A> {
         }
     }
 
-    unsafe fn mark_garbage(ptr: *mut Chunk<V, A>) {
+    unsafe fn mark_garbage(ptr: *mut Chunk<V, A, ALLOC>) {
         // Caller promise this chunk will not be reachable from the outside except snapshot in threads
         {
             let chunk = &*ptr;
@@ -635,12 +635,12 @@ impl<V, A: Attachment<V>> Chunk<V, A> {
         }
         Self::check_gc(ptr);
     }
-    unsafe fn check_gc(ptr: *mut Chunk<V, A>) {
+    unsafe fn check_gc(ptr: *mut Chunk<V, A, ALLOC>) {
         let chunk = &*ptr;
         if chunk.refs.load(Relaxed) == 0 && chunk.refs.compare_and_swap(0, core::usize::MAX, Relaxed) == 0 {
             chunk.attachment.dealloc();
-            dealloc_mem(ptr as usize, mem::size_of::<Self>());
-            dealloc_mem(chunk.base, chunk_size_of(chunk.capacity));
+            dealloc_mem::<ALLOC>(ptr as usize, mem::size_of::<Self>());
+            dealloc_mem::<ALLOC>(chunk.base, chunk_size_of(chunk.capacity));
         }
     }
 }
@@ -654,7 +654,7 @@ impl ModOutput {
     }
 }
 
-impl<V, A: Attachment<V>> Drop for ChunkRef<V, A> {
+impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for ChunkRef<V, A, ALLOC> {
     fn drop(&mut self) {
         {
             if self.ptr as usize == 0 {
@@ -667,8 +667,8 @@ impl<V, A: Attachment<V>> Drop for ChunkRef<V, A> {
     }
 }
 
-impl<V, A: Attachment<V>> Deref for ChunkRef<V, A> {
-    type Target = Chunk<V, A>;
+impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Deref for ChunkRef<V, A, ALLOC> {
+    type Target = Chunk<V, A, ALLOC>;
 
     fn deref(&self) -> &Self::Target {
         debug_assert_ne!(self.ptr as usize, 0);
@@ -676,10 +676,10 @@ impl<V, A: Attachment<V>> Deref for ChunkRef<V, A> {
     }
 }
 
-impl<V, A: Attachment<V>> ChunkRef<V, A> {
+impl<V, A: Attachment<V>, ALLOC: Alloc + Default> ChunkRef<V, A, ALLOC> {
     fn null_ref() -> Self {
         Self {
-            ptr: 0 as *mut Chunk<V, A>,
+            ptr: 0 as *mut Chunk<V, A, ALLOC>,
         }
     }
 }
@@ -728,20 +728,20 @@ impl Attachment<()> for WordAttachment {
     fn dealloc(&self) {}
 }
 
-pub type WordTable = Table<(), WordAttachment>;
+pub type WordTable<ALLOC: Alloc + Default = Global> = Table<(), WordAttachment, ALLOC>;
 
-pub struct ObjectAttachment<T> {
+pub struct ObjectAttachment<T, A: Alloc + Default> {
     obj_chunk: usize,
     size: usize,
     obj_size: usize,
-    shadow: PhantomData<T>,
+    shadow: PhantomData<(T, A)>,
 }
 
-impl<T: Clone> Attachment<T> for ObjectAttachment<T> {
+impl<T: Clone, A: Alloc + Default> Attachment<T> for ObjectAttachment<T, A> {
     fn new(cap: usize) -> Self {
         let obj_size = mem::size_of::<T>();
         let obj_chunk_size = cap * obj_size;
-        let addr = alloc_mem(obj_chunk_size);
+        let addr = alloc_mem::<A>(obj_chunk_size);
         Self {
             obj_chunk: addr,
             size: obj_chunk_size,
@@ -765,11 +765,11 @@ impl<T: Clone> Attachment<T> for ObjectAttachment<T> {
     }
 
     fn dealloc(&self) {
-        dealloc_mem(self.obj_chunk, self.size);
+        dealloc_mem::<A>(self.obj_chunk, self.size);
     }
 }
 
-impl<T> ObjectAttachment<T> {
+impl<T, A: Alloc + Default> ObjectAttachment<T, A> {
     fn addr_by_index(&self, index: usize) -> usize {
         self.obj_chunk + index * self.obj_size
     }
@@ -786,8 +786,8 @@ pub trait Map<K, V> {
 
 const NUM_KEY_FIX: usize = 5;
 
-pub struct ObjectMap<V: Clone> {
-    table: Table<V, ObjectAttachment<V>>,
+pub struct ObjectMap<V: Clone, ALLOC: Alloc + Default = Global> {
+    table: Table<V, ObjectAttachment<V, ALLOC>, ALLOC>,
 }
 
 impl<V: Clone> Map<usize, V> for ObjectMap<V> {
@@ -858,16 +858,18 @@ impl Map<usize, usize> for WordMap {
 }
 
 #[inline(always)]
-fn alloc_mem(size: usize) -> usize {
+fn alloc_mem<A: Alloc + Default>(size: usize) -> usize {
     let align = mem::align_of::<EntryTemplate>();
     let layout = Layout::from_size_align(size, align).unwrap();
+    let mut alloc = A::default();
     // must be all zeroed
-    unsafe { Global.alloc_zeroed(layout) }.unwrap().as_ptr() as usize
+    unsafe { alloc.alloc_zeroed(layout) }.unwrap().as_ptr() as usize
 }
 
 #[inline(always)]
-fn dealloc_mem(ptr: usize, size: usize) {
+fn dealloc_mem<A: Alloc + Default + Default>(ptr: usize, size: usize) {
     let align = mem::align_of::<EntryTemplate>();
     let layout = Layout::from_size_align(size, align).unwrap();
-    unsafe { Global.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
+    let mut alloc = A::default();
+    unsafe { alloc.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
 }
