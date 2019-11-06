@@ -639,8 +639,8 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
         let chunk = &*ptr;
         if chunk.refs.load(Relaxed) == 0 && chunk.refs.compare_and_swap(0, core::usize::MAX, Relaxed) == 0 {
             chunk.attachment.dealloc();
-            dealloc_mem::<ALLOC>(ptr as usize, mem::size_of::<Self>());
             dealloc_mem::<ALLOC>(chunk.base, chunk_size_of(chunk.capacity));
+            dealloc_mem::<ALLOC>(ptr as usize, mem::size_of::<Self>());
         }
     }
 }
