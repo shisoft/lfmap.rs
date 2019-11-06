@@ -728,7 +728,7 @@ impl Attachment<()> for WordAttachment {
     fn dealloc(&self) {}
 }
 
-pub type WordTable<ALLOC: Alloc + Default = Global> = Table<(), WordAttachment, ALLOC>;
+pub type WordTable<ALLOC: Alloc + Default> = Table<(), WordAttachment, ALLOC>;
 
 pub struct ObjectAttachment<T, A: Alloc + Default> {
     obj_chunk: usize,
@@ -822,8 +822,8 @@ impl<V: Clone> Map<usize, V> for ObjectMap<V> {
     }
 }
 
-pub struct WordMap {
-    table: WordTable,
+pub struct WordMap<ALLOC: Alloc + Default = Global> {
+    table: WordTable<ALLOC>,
 }
 
 impl Map<usize, usize> for WordMap {
