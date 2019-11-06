@@ -1,12 +1,15 @@
+#![feature(allocator_api)]
+
 extern crate lfmap;
 use lfmap::*;
 use std::sync::{Arc, Once};
 use std::thread;
+use std::alloc::Global;
 
 #[test]
 fn will_not_overflow() {
     env_logger::try_init();
-    let table = WordMap::with_capacity(16);
+    let table = WordMap::<Global>::with_capacity(16);
     for i in 50..60 {
         assert_eq!(table.insert(i, i), None);
     }
@@ -18,7 +21,7 @@ fn will_not_overflow() {
 #[test]
 fn resize() {
     env_logger::try_init();
-    let map = WordMap::with_capacity(16);
+    let map = WordMap::<Global>::with_capacity(16);
     for i in 5..2048 {
         map.insert(i, i * 2);
     }
@@ -33,7 +36,7 @@ fn resize() {
 #[test]
 fn parallel_no_resize() {
     env_logger::try_init();
-    let map = Arc::new(WordMap::with_capacity(65536));
+    let map = Arc::new(WordMap::<Global>::with_capacity(65536));
     let mut threads = vec![];
     for i in 5..99 {
         map.insert(i, i * 10);
@@ -68,7 +71,7 @@ fn parallel_no_resize() {
 
 #[test]
 fn parallel_with_resize() {
-    let map = Arc::new(WordMap::with_capacity(32));
+    let map = Arc::new(WordMap::<Global>::with_capacity(32));
     let mut threads = vec![];
     for i in 5..24 {
         let map = map.clone();
@@ -94,7 +97,7 @@ fn parallel_with_resize() {
 
 #[test]
 fn parallel_hybird() {
-    let map = Arc::new(WordMap::with_capacity(32));
+    let map = Arc::new(WordMap::<Global>::with_capacity(32));
     for i in 5..128 {
         map.insert(i, i * 10);
     }
@@ -150,7 +153,7 @@ fn obj_map() {
             assert_eq!(self.d, num + 3);
         }
     }
-    let map = ObjectMap::with_capacity(16);
+    let map = ObjectMap::<Obj, Global>::with_capacity(16);
     for i in 5..2048 {
         map.insert(i, Obj::new(i));
     }
