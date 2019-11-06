@@ -436,7 +436,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         {
             // other thread have allocated new chunk and wins the competition, exit
             unsafe {
-                Chunk::mark_garbage(new_chunk_ptr);
+                Chunk::unref(new_chunk_ptr);
             }
             return true;
         }
@@ -528,7 +528,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         }
         debug!("{}", self.dump(new_base, new_cap));
         unsafe {
-            Chunk::mark_garbage(old_chunk_ptr);
+            Chunk::unref(old_chunk_ptr);
         }
         return true;
     }
@@ -551,10 +551,10 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for Table<V, A, ALLOC> {
         let new_chunk = self.new_chunk.load(Relaxed);
         unsafe {
             if old_chunk != null_mut() {
-                Chunk::mark_garbage(old_chunk);
+                Chunk::unref(old_chunk);
             }
             if old_chunk != new_chunk  && new_chunk != null_mut() {
-                Chunk::mark_garbage(new_chunk);
+                Chunk::unref(new_chunk);
             }
         }
     }
@@ -627,11 +627,20 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
         }
     }
 
-    unsafe fn mark_garbage(ptr: *mut Chunk<V, A, ALLOC>) {
+    unsafe fn unref(ptr: *mut Chunk<V, A, ALLOC>) {
         // Caller promise this chunk will not be reachable from the outside except snapshot in threads
         {
             let chunk = &*ptr;
-            chunk.refs.fetch_sub(1, Relaxed);
+            loop {
+                let rc = chunk.refs.load(Relaxed);
+                if rc >= 1 {
+                    if chunk.refs.compare_and_swap(rc, rc - 1, Relaxed) == rc {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
         }
         Self::check_gc(ptr);
     }
