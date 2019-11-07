@@ -629,28 +629,20 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
 
     unsafe fn unref(ptr: *mut Chunk<V, A, ALLOC>) {
         // Caller promise this chunk will not be reachable from the outside except snapshot in threads
-        {
+        if ptr == null_mut() { return; }
+        let rc = {
             let chunk = &*ptr;
-            loop {
-                let rc = chunk.refs.load(Relaxed);
-                if rc >= 1 {
-                    if chunk.refs.compare_and_swap(rc, rc - 1, Relaxed) == rc {
-                        break;
-                    }
-                } else {
-                    break;
-                }
-            }
+            chunk.refs.fetch_sub(1, Relaxed)
+        };
+        if rc == 1 {
+            Self::gc(ptr);
         }
-        Self::check_gc(ptr);
     }
-    unsafe fn check_gc(ptr: *mut Chunk<V, A, ALLOC>) {
+    unsafe fn gc(ptr: *mut Chunk<V, A, ALLOC>) {
         let chunk = &*ptr;
-        if chunk.refs.load(Relaxed) == 0 && chunk.refs.compare_and_swap(0, core::usize::MAX, Relaxed) == 0 {
-            chunk.attachment.dealloc();
-            dealloc_mem::<ALLOC>(chunk.base, chunk_size_of(chunk.capacity));
-            dealloc_mem::<ALLOC>(ptr as usize, mem::size_of::<Self>());
-        }
+        chunk.attachment.dealloc();
+        dealloc_mem::<ALLOC>(chunk.base, chunk_size_of(chunk.capacity));
+        dealloc_mem::<ALLOC>(ptr as usize, mem::size_of::<Self>());
     }
 }
 
@@ -665,14 +657,7 @@ impl ModOutput {
 
 impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for ChunkRef<V, A, ALLOC> {
     fn drop(&mut self) {
-        {
-            if self.ptr as usize == 0 {
-                return;
-            }
-            let chunk = unsafe { &*self.ptr };
-            chunk.refs.fetch_sub(1, Relaxed);
-        }
-        unsafe { Chunk::check_gc(self.ptr) }
+        unsafe { Chunk::unref(self.ptr); }
     }
 }
 
