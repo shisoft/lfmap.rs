@@ -717,12 +717,16 @@ impl Attachment<()> for WordAttachment {
         Self
     }
 
+    #[inline(always)]
     fn get(&self, index: usize, key: usize) -> () {}
 
+    #[inline(always)]
     fn set(&self, index: usize, key: usize, att_value: ()) {}
 
+    #[inline(always)]
     fn erase(&self, index: usize, key: usize) {}
 
+    #[inline(always)]
     fn dealloc(&self) {}
 }
 
@@ -748,20 +752,24 @@ impl<T: Clone, A: Alloc + Default> Attachment<T> for ObjectAttachment<T, A> {
         }
     }
 
+    #[inline(always)]
     fn get(&self, index: usize, key: usize) -> T {
         let addr = self.addr_by_index(index);
         unsafe { (*(addr as *mut T)).clone() }
     }
 
+    #[inline(always)]
     fn set(&self, index: usize, key: usize, att_value: T) {
         let addr = self.addr_by_index(index);
         unsafe { ptr::write(addr as *mut T, att_value) }
     }
 
+    #[inline(always)]
     fn erase(&self, index: usize, key: usize) {
         unsafe { drop(self.addr_by_index(index) as *mut T) }
     }
 
+    #[inline(always)]
     fn dealloc(&self) {
         dealloc_mem::<A>(self.obj_chunk, self.size);
     }
@@ -795,18 +803,22 @@ impl<V: Clone, ALLOC: Alloc + Default> Map<usize, V> for ObjectMap<V, ALLOC> {
         }
     }
 
+    #[inline(always)]
     fn get(&self, key: usize) -> Option<V> {
         self.table.get(key + NUM_KEY_FIX, true).map(|v| v.1.unwrap())
     }
 
+    #[inline(always)]
     fn insert(&self, key: usize, value: V) -> Option<()> {
         self.table.insert(key + NUM_KEY_FIX, !0, value).map(|_| ())
     }
 
+    #[inline(always)]
     fn remove(&self, key: usize) -> Option<V> {
         self.table.remove(key + NUM_KEY_FIX).map(|(_, v)| v)
     }
 
+    #[inline(always)]
     fn entries(&self) -> Vec<(usize, V)> {
         self.table
             .entries()
@@ -815,6 +827,7 @@ impl<V: Clone, ALLOC: Alloc + Default> Map<usize, V> for ObjectMap<V, ALLOC> {
             .collect()
     }
 
+    #[inline(always)]
     fn contains(&self, key: usize) -> bool {
         self.table.get(key + NUM_KEY_FIX, false).is_some()
     }
@@ -831,14 +844,17 @@ impl <ALLOC: Alloc + Default> Map <usize, usize> for WordMap<ALLOC> {
         }
     }
 
+    #[inline(always)]
     fn get(&self, key: usize) -> Option<usize> {
         self.table.get(key + NUM_KEY_FIX, false).map(|v| v.0)
     }
 
+    #[inline(always)]
     fn insert(&self, key: usize, value: usize) -> Option<()> {
         self.table.insert(key + NUM_KEY_FIX, value, ()).map(|_| ())
     }
 
+    #[inline(always)]
     fn remove(&self, key: usize) -> Option<usize> {
         self.table.remove(key + NUM_KEY_FIX).map(|(v, _)| v)
     }
@@ -850,6 +866,7 @@ impl <ALLOC: Alloc + Default> Map <usize, usize> for WordMap<ALLOC> {
             .collect()
     }
 
+    #[inline(always)]
     fn contains(&self, key: usize) -> bool {
         self.get(key).is_some()
     }
