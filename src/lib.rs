@@ -226,8 +226,9 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         let cap = chunk.capacity;
         let base = chunk.base;
         let mut counter = 0;
+        let cap_mask = cap - 1;
         while counter < cap {
-            idx &= (cap - 1);
+            idx &= cap_mask;
             let addr = base + idx * entry_size;
             let k = self.get_key(addr);
             if k == key {
@@ -255,8 +256,9 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         let entry_size = mem::size_of::<EntryTemplate>();
         let mut replaced = None;
         let mut count = 0;
+        let cap_mask = cap - 1;
         while count <= cap {
-            idx &= (cap - 1);
+            idx &= cap_mask;
             let addr = base + idx * entry_size;
             let k = self.get_key(addr);
             if k == key {
@@ -355,8 +357,9 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         let base = chunk.base;
         let mut counter = 0;
         let mut res = vec![];
+        let cap_mask = cap - 1;
         while counter < cap {
-            idx &= (cap - 1);
+            idx &= cap_mask;
             let addr = base + idx * entry_size;
             let k = self.get_key(addr);
             if k != EMPTY_KEY {
@@ -678,6 +681,7 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> ChunkRef<V, A, ALLOC> {
     }
 }
 
+#[inline(always)]
 fn is_power_of_2(x: usize) -> bool {
     (x != 0) && ((x & (x - 1)) == 0)
 }
