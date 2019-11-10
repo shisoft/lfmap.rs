@@ -16,6 +16,9 @@ fn will_not_overflow() {
     for i in 50..60 {
         assert_eq!(table.get(i), Some(i));
     }
+    for i in 50..60 {
+        assert_eq!(table.remove(i), Some(i));
+    }
 }
 
 #[test]

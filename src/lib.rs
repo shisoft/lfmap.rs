@@ -179,8 +179,8 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
             let mut retr = None;
             match res.result {
                 ModResult::Done(v) | ModResult::Replaced(v) => {
+                    retr = Some((v, new_chunk.attachment.get(res.index, key)));
                     if copying {
-                        retr = Some((v, new_chunk.attachment.get(res.index, key)));
                         debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
                         fence(SeqCst);
                         self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
