@@ -12,7 +12,7 @@ use core::iter::Copied;
 use core::marker::PhantomData;
 use core::ops::Deref;
 use core::ptr::NonNull;
-use core::sync::atomic::Ordering::{Acquire, Relaxed, Release, SeqCst};
+use core::sync::atomic::Ordering::{Relaxed, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
 use core::{intrinsics, mem, ptr};
 use std::ptr::{drop_in_place, null, null_mut};
@@ -103,7 +103,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     }
 
     pub fn get(&self, key: usize, read_attachment: bool) -> Option<(usize, Option<V>)> {
-        let mut chunk = unsafe { Chunk::borrow(self.old_chunk.load(SeqCst)) };
+        let mut chunk = unsafe { Chunk::borrow(self.old_chunk.load(Relaxed)) };
         loop {
             let (val, idx) = self.get_from_chunk(&*chunk, key);
             match val.parsed {
@@ -119,7 +119,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
                 }
                 ParsedValue::Sentinel => {
                     let old_chunk_base = chunk.base;
-                    chunk = unsafe { Chunk::borrow(self.new_chunk.load(SeqCst)) };
+                    chunk = unsafe { Chunk::borrow(self.new_chunk.load(Relaxed)) };
                 }
                 ParsedValue::Empty => return None,
             }
@@ -208,10 +208,10 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         F: Fn(*mut Chunk<V, A, ALLOC>) -> Result<R, R>,
     {
         loop {
-            let new_chunk_ptr = self.new_chunk.load(SeqCst);
+            let new_chunk_ptr = self.new_chunk.load(Relaxed);
             let f_res = f(new_chunk_ptr);
             match f_res {
-                Ok(r) if self.new_chunk.load(SeqCst) == new_chunk_ptr => return r,
+                Ok(r) if self.new_chunk.load(Relaxed) == new_chunk_ptr => return r,
                 Err(r) => return r,
                 _ => {
                     debug!("Invalid write new, retry");
@@ -434,7 +434,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         let new_chunk_ptr = Chunk::alloc_chunk(new_cap);
         if self
             .new_chunk
-            .compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst)
+            .compare_and_swap(old_chunk_ptr, new_chunk_ptr, Relaxed)
             != old_chunk_ptr
         {
             // other thread have allocated new chunk and wins the competition, exit
@@ -524,7 +524,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         debug_assert_ne!(old_chunk_ptr as usize, new_base);
         if self
             .old_chunk
-            .compare_and_swap(old_chunk_ptr, new_chunk_ptr, SeqCst)
+            .compare_and_swap(old_chunk_ptr, new_chunk_ptr, Relaxed)
             != old_chunk_ptr
         {
             panic!();
