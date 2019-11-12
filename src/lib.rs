@@ -356,7 +356,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         let cap = chunk.capacity;
         let base = chunk.base;
         let mut counter = 0;
-        let mut res = vec![];
+        let mut res = Vec::with_capacity(chunk.occupation.load(Relaxed));
         let cap_mask = cap - 1;
         while counter < cap {
             idx &= cap_mask;
