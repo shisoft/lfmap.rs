@@ -7,18 +7,18 @@ extern crate log;
 // usize to usize lock-free, wait free table
 use alloc::alloc::Global;
 use alloc::string::String;
-use core::alloc::{Alloc, Layout, GlobalAlloc};
+use alloc::vec::Vec;
+use core::alloc::{Alloc, GlobalAlloc, Layout};
 use core::cmp::Ordering;
 use core::iter::Copied;
 use core::marker::PhantomData;
 use core::ops::Deref;
 use core::ptr::NonNull;
+use core::ptr::{drop_in_place, null, null_mut};
 use core::sync::atomic::Ordering::{Relaxed, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
 use core::{intrinsics, mem, ptr};
-use core::ptr::{drop_in_place, null, null_mut};
 use ModOp::Empty;
-use alloc::vec::Vec;
 
 pub type EntryTemplate = (usize, usize);
 
@@ -150,9 +150,13 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
             ModResult::Done(_) => {}
             ModResult::Replaced(v) | ModResult::Fail(v) => result = Some(v),
             ModResult::TableFull => {
-                panic!("Insertion is too fast, copying {}, cap {}, count {}, dump: {}",
-                       copying, new_chunk.capacity, new_chunk.occupation.load(Relaxed),
-                       self.dump(new_chunk.base, new_chunk.capacity));
+                panic!(
+                    "Insertion is too fast, copying {}, cap {}, count {}, dump: {}",
+                    copying,
+                    new_chunk.capacity,
+                    new_chunk.occupation.load(Relaxed),
+                    self.dump(new_chunk.base, new_chunk.capacity)
+                );
             }
             ModResult::Sentinel => {
                 debug!("Insert new and see sentinel, abort");
@@ -538,7 +542,7 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for Table<V, A, ALLOC> {
             if old_chunk != null_mut() {
                 Chunk::unref(old_chunk);
             }
-            if old_chunk != new_chunk  && new_chunk != null_mut() {
+            if old_chunk != new_chunk && new_chunk != null_mut() {
                 Chunk::unref(new_chunk);
             }
         }
@@ -546,7 +550,10 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for Table<V, A, ALLOC> {
 }
 
 impl Value {
-    pub fn new<V, A: Attachment<V>, ALLOC: Alloc + Default>(val: usize, table: &Table<V, A, ALLOC>) -> Self {
+    pub fn new<V, A: Attachment<V>, ALLOC: Alloc + Default>(
+        val: usize,
+        table: &Table<V, A, ALLOC>,
+    ) -> Self {
         let res = {
             if val == 0 {
                 ParsedValue::Empty
@@ -614,7 +621,9 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
 
     unsafe fn unref(ptr: *mut Chunk<V, A, ALLOC>) {
         // Caller promise this chunk will not be reachable from the outside except snapshot in threads
-        if ptr == null_mut() { return; }
+        if ptr == null_mut() {
+            return;
+        }
         let rc = {
             let chunk = &*ptr;
             chunk.refs.fetch_sub(1, Relaxed)
@@ -642,7 +651,9 @@ impl ModOutput {
 
 impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for ChunkRef<V, A, ALLOC> {
     fn drop(&mut self) {
-        unsafe { Chunk::unref(self.ptr); }
+        unsafe {
+            Chunk::unref(self.ptr);
+        }
     }
 }
 
@@ -787,7 +798,9 @@ impl<V: Clone, ALLOC: Alloc + Default> Map<usize, V> for ObjectMap<V, ALLOC> {
 
     #[inline(always)]
     fn get(&self, key: usize) -> Option<V> {
-        self.table.get(key + NUM_KEY_FIX, true).map(|v| v.1.unwrap())
+        self.table
+            .get(key + NUM_KEY_FIX, true)
+            .map(|v| v.1.unwrap())
     }
 
     #[inline(always)]
@@ -819,7 +832,7 @@ pub struct WordMap<ALLOC: Alloc + Default = Global> {
     table: WordTable<ALLOC>,
 }
 
-impl <ALLOC: Alloc + Default> Map <usize, usize> for WordMap<ALLOC> {
+impl<ALLOC: Alloc + Default> Map<usize, usize> for WordMap<ALLOC> {
     fn with_capacity(cap: usize) -> Self {
         Self {
             table: Table::with_capacity(cap),

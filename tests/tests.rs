@@ -2,9 +2,9 @@
 
 extern crate lfmap;
 use lfmap::*;
+use std::alloc::Global;
 use std::sync::{Arc, Once};
 use std::thread;
-use std::alloc::Global;
 
 #[test]
 fn will_not_overflow() {
