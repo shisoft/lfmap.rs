@@ -1,5 +1,6 @@
 #![feature(allocator_api)]
 #![feature(core_intrinsics)]
+#![no_std]
 extern crate alloc;
 #[macro_use]
 extern crate log;
@@ -15,8 +16,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::Ordering::{Relaxed, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
 use core::{intrinsics, mem, ptr};
-use std::ptr::{drop_in_place, null, null_mut};
+use core::ptr::{drop_in_place, null, null_mut};
 use ModOp::Empty;
+use alloc::vec::Vec;
 
 pub type EntryTemplate = (usize, usize);
 
@@ -128,96 +130,76 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
 
     pub fn insert(&self, key: usize, value: usize, attached_val: V) -> Option<(usize)> {
         debug!("Inserting key: {}, value: {}", key, value);
-        let result = self.ensure_write_new(|new_chunk_ptr| {
-            let old_chunk_ptr = self.old_chunk.load(Relaxed);
-            let copying = new_chunk_ptr != old_chunk_ptr;
-            let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
-            if !copying && self.check_resize(&old_chunk) {
-                debug!("Resized, retry insertion key: {}, value {}", key, value);
-                return Err(self.insert(key, value, attached_val.clone()));
+        let new_chunk_ptr = self.new_chunk.load(Relaxed);
+        let old_chunk_ptr = self.old_chunk.load(Relaxed);
+        let copying = new_chunk_ptr != old_chunk_ptr;
+        let old_chunk = unsafe { Chunk::borrow(old_chunk_ptr) };
+        if !copying && self.check_resize(&old_chunk) {
+            debug!("Resized, retry insertion key: {}, value {}", key, value);
+            return self.insert(key, value, attached_val.clone());
+        }
+        let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let value_insertion = self.modify_entry(
+            &*new_chunk,
+            key,
+            ModOp::Insert(value & self.val_bit_mask, attached_val.clone()),
+        );
+        let insertion_index = value_insertion.index;
+        let mut result = None;
+        match value_insertion.result {
+            ModResult::Done(_) => {}
+            ModResult::Replaced(v) | ModResult::Fail(v) => result = Some(v),
+            ModResult::TableFull => {
+                panic!("Insertion is too fast, copying {}, cap {}, count {}, dump: {}",
+                       copying, new_chunk.capacity, new_chunk.occupation.load(Relaxed),
+                       self.dump(new_chunk.base, new_chunk.capacity));
             }
-            let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
-            let value_insertion = self.modify_entry(
-                &*new_chunk,
-                key,
-                ModOp::Insert(value & self.val_bit_mask, attached_val.clone()),
-            );
-            let insertion_index = value_insertion.index;
-            let mut result = None;
-            match value_insertion.result {
-                ModResult::Done(_) => {}
-                ModResult::Replaced(v) | ModResult::Fail(v) => result = Some(v),
-                ModResult::TableFull => {
-                    panic!("Insertion is too fast, copying {}, cap {}, count {}, dump: {}",
-                           copying, new_chunk.capacity, new_chunk.occupation.load(Relaxed),
-                           self.dump(new_chunk.base, new_chunk.capacity));
-                }
-                ModResult::Sentinel => {
-                    debug!("Insert new and see sentinel, abort");
-                    return Ok(None);
-                }
-                _ => unreachable!("{:?}, copying: {}", value_insertion.result, copying),
+            ModResult::Sentinel => {
+                debug!("Insert new and see sentinel, abort");
+                return None;
             }
-            if copying {
-                debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
-                fence(SeqCst);
-                self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
-            }
-            new_chunk.occupation.fetch_add(1, Relaxed);
-            Ok(result)
-        });
+            _ => unreachable!("{:?}, copying: {}", value_insertion.result, copying),
+        }
+        if copying {
+            debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
+            fence(SeqCst);
+            self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
+        }
+        new_chunk.occupation.fetch_add(1, Relaxed);
         result
     }
 
     pub fn remove(&self, key: usize) -> Option<(usize, V)> {
-        self.ensure_write_new(|new_chunk_ptr| {
-            let old_chunk_ptr = self.old_chunk.load(Relaxed);
-            let copying = new_chunk_ptr != old_chunk_ptr;
-            let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
-            let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
-            let mut res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
-            let mut retr = None;
-            match res.result {
-                ModResult::Done(v) | ModResult::Replaced(v) => {
-                    retr = Some((v, new_chunk.attachment.get(res.index, key)));
-                    if copying {
-                        debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
-                        fence(SeqCst);
-                        self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
-                    }
-                }
-                ModResult::NotFound => {
-                    let remove_from_old = self.modify_entry(&*old_chunk, key, ModOp::Empty);
-                    match remove_from_old.result {
-                        ModResult::Done(v) | ModResult::Replaced(v) => {
-                            retr = Some((v, new_chunk.attachment.get(res.index, key)));
-                        }
-                        _ => {}
-                    }
-                    res = remove_from_old;
-                }
-                ModResult::TableFull => panic!("need to handle TableFull by remove"),
-                _ => {}
-            };
-            Ok(retr)
-        })
-    }
-
-    fn ensure_write_new<R, F>(&self, f: F) -> R
-    where
-        F: Fn(*mut Chunk<V, A, ALLOC>) -> Result<R, R>,
-    {
-        loop {
-            let new_chunk_ptr = self.new_chunk.load(Relaxed);
-            let f_res = f(new_chunk_ptr);
-            match f_res {
-                Ok(r) if self.new_chunk.load(Relaxed) == new_chunk_ptr => return r,
-                Err(r) => return r,
-                _ => {
-                    debug!("Invalid write new, retry");
+        let new_chunk_ptr = self.new_chunk.load(Relaxed);
+        let old_chunk_ptr = self.old_chunk.load(Relaxed);
+        let copying = new_chunk_ptr != old_chunk_ptr;
+        let new_chunk = unsafe { Chunk::borrow(new_chunk_ptr) };
+        let old_chunk = unsafe { Chunk::borrow_if_cond(old_chunk_ptr, copying) };
+        let mut res = self.modify_entry(&*new_chunk, key, ModOp::Empty);
+        let mut retr = None;
+        match res.result {
+            ModResult::Done(v) | ModResult::Replaced(v) => {
+                retr = Some((v, new_chunk.attachment.get(res.index, key)));
+                if copying {
+                    debug_assert_ne!(new_chunk_ptr, old_chunk_ptr);
+                    fence(SeqCst);
+                    self.modify_entry(&*old_chunk, key, ModOp::Sentinel);
                 }
             }
-        }
+            ModResult::NotFound => {
+                let remove_from_old = self.modify_entry(&*old_chunk, key, ModOp::Empty);
+                match remove_from_old.result {
+                    ModResult::Done(v) | ModResult::Replaced(v) => {
+                        retr = Some((v, new_chunk.attachment.get(res.index, key)));
+                    }
+                    _ => {}
+                }
+                res = remove_from_old;
+            }
+            ModResult::TableFull => panic!("need to handle TableFull by remove"),
+            _ => {}
+        };
+        retr
     }
 
     fn get_from_chunk(&self, chunk: &Chunk<V, A, ALLOC>, key: usize) -> (Value, usize) {
@@ -275,9 +257,8 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
                             ModOp::Empty | ModOp::Insert(_, _) => {
                                 if !self.set_tombstone(addr, val.raw) {
                                     // this insertion have conflict with others
-                                    // other thread changed the value
-                                    // should fail (?)
-                                    return ModOutput::new(ModResult::Fail(*v), idx);
+                                    // other thread changed the value (empty)
+                                    // should continue
                                 } else {
                                     // we have put tombstone on the value
                                     chunk.attachment.erase(idx, key);
@@ -356,7 +337,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         let cap = chunk.capacity;
         let base = chunk.base;
         let mut counter = 0;
-        let mut res = vec![];
+        let mut res = Vec::new();
         let cap_mask = cap - 1;
         while counter < cap {
             idx &= cap_mask;
@@ -481,17 +462,18 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
                             ModResult::NotFound => unreachable!(),
                             ModResult::TableFull => panic!(),
                         };
-                        if let Some(entry_addr) = inserted_addr {
+                        if let Some(new_entry_addr) = inserted_addr {
                             fence(SeqCst);
-                            // cas to ensure sentinel into old chunk
+                            // CAS to ensure sentinel into old chunk (spec)
+                            // Use CAS for old threads may working on this one
                             if self.cas_value(old_address, value.raw, SENTINEL_VALUE) {
                                 // strip prime
                                 let stripped = primed_val & self.val_bit_mask;
                                 debug_assert_ne!(stripped, SENTINEL_VALUE);
-                                if self.cas_value(entry_addr, primed_val, stripped) {
+                                if self.cas_value(new_entry_addr, primed_val, stripped) {
                                     debug!(
                                         "Effective copy key: {}, value {}, addr: {}",
-                                        key, stripped, entry_addr
+                                        key, stripped, new_entry_addr
                                     );
                                     old_chunk_ref.attachment.erase(idx, key);
                                     effective_copy += 1;
