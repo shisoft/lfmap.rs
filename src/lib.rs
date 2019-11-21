@@ -701,7 +701,7 @@ fn is_power_of_2(x: usize) -> bool {
 
 #[inline(always)]
 fn occupation_limit(cap: usize) -> usize {
-    (cap as f64 * 0.6f64) as usize
+    (cap as f64 * 0.75f64) as usize
 }
 
 #[inline(always)]
