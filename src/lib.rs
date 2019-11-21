@@ -25,6 +25,7 @@ pub type EntryTemplate = (usize, usize);
 const EMPTY_KEY: usize = 0;
 const EMPTY_VALUE: usize = 0;
 const SENTINEL_VALUE: usize = 1;
+const HASH_MAGIC_NUMBER: usize = 67280421310721; // prime number
 
 struct Value {
     raw: usize,
@@ -208,12 +209,12 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     }
 
     fn get_from_chunk(&self, chunk: &Chunk<V, A, ALLOC>, key: usize) -> (Value, usize) {
-        let mut idx = key;
+        let mut idx = chunk.hash(key);
         let entry_size = mem::size_of::<EntryTemplate>();
         let cap = chunk.capacity;
         let base = chunk.base;
+        let cap_mask  = chunk.cap_mask();
         let mut counter = 0;
-        let cap_mask = cap - 1;
         while counter < cap {
             idx &= cap_mask;
             let addr = base + idx * entry_size;
@@ -239,11 +240,11 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     fn modify_entry(&self, chunk: &Chunk<V, A, ALLOC>, key: usize, op: ModOp<V>) -> ModOutput {
         let cap = chunk.capacity;
         let base = chunk.base;
-        let mut idx = key;
+        let mut idx = chunk.hash(key);
         let entry_size = mem::size_of::<EntryTemplate>();
         let mut replaced = None;
         let mut count = 0;
-        let cap_mask = cap - 1;
+        let cap_mask = chunk.cap_mask();
         while count <= cap {
             idx &= cap_mask;
             let addr = base + idx * entry_size;
@@ -343,7 +344,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
         let base = chunk.base;
         let mut counter = 0;
         let mut res = Vec::with_capacity(chunk.occupation.load(Relaxed));
-        let cap_mask = cap - 1;
+        let cap_mask = chunk.cap_mask();
         while counter < cap {
             idx &= cap_mask;
             let addr = base + idx * entry_size;
@@ -652,6 +653,18 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
         chunk.attachment.dealloc();
         dealloc_mem::<ALLOC>(ptr as usize, chunk.total_size);
     }
+
+    #[inline]
+    fn hash(&self, mut num: usize) -> usize {
+        num ^= HASH_MAGIC_NUMBER;
+        num ^= num << 13;
+        num ^= num >> 17;
+        num ^= num << 5;
+        num
+    }
+
+    #[inline]
+    fn cap_mask(&self) -> usize { self.capacity - 1  }
 }
 
 impl ModOutput {
