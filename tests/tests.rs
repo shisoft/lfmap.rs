@@ -1,10 +1,13 @@
 #![feature(allocator_api)]
-
+#![feature(test)]
+extern crate test;
 extern crate lfmap;
 use lfmap::*;
-use std::alloc::Global;
+use std::alloc::{Global, System};
 use std::sync::{Arc, Once};
 use std::thread;
+use test::Bencher;
+use std::collections::HashMap;
 
 #[test]
 fn will_not_overflow() {
@@ -166,6 +169,26 @@ fn obj_map() {
             None => panic!("{}", i),
         }
     }
+}
+
+#[bench]
+fn lfmap(b: &mut Bencher) {
+    let map = WordMap::<System>::with_capacity(128);
+    let mut i = 5;
+    b.iter(|| {
+        map.insert(i, i);
+        i += 1;
+    });
+}
+
+#[bench]
+fn hashmap(b: &mut Bencher) {
+    let mut map = HashMap::new();
+    let mut i = 5;
+    b.iter(|| {
+        map.insert(i, i);
+        i += 1;
+    });
 }
 
 //#![feature(core_intrinsics)]
