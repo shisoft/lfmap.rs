@@ -717,8 +717,8 @@ fn chunk_size_of(cap: usize) -> usize {
 #[inline(always)]
 pub  fn hash(mut num: usize) -> usize {
     num ^= HASH_MAGIC_NUMBER_1;
-    num ^= (num ^ HASH_MAGIC_NUMBER_2) << 3;
-    num ^= (num ^ HASH_MAGIC_NUMBER_3) >> 5;
+    num ^= (num ^ HASH_MAGIC_NUMBER_2).wrapping_shl(7);
+    num ^= (num ^ HASH_MAGIC_NUMBER_3).wrapping_shr(9);
     num
 }
 
