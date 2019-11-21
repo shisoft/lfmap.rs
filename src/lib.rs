@@ -25,7 +25,9 @@ pub type EntryTemplate = (usize, usize);
 const EMPTY_KEY: usize = 0;
 const EMPTY_VALUE: usize = 0;
 const SENTINEL_VALUE: usize = 1;
-const HASH_MAGIC_NUMBER: usize = 67280421310721; // prime number
+const HASH_MAGIC_NUMBER_1: usize = 67280421310721;
+const HASH_MAGIC_NUMBER_2: usize = 123456789;
+const HASH_MAGIC_NUMBER_3: usize = 362436069;
 
 struct Value {
     raw: usize,
@@ -209,7 +211,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     }
 
     fn get_from_chunk(&self, chunk: &Chunk<V, A, ALLOC>, key: usize) -> (Value, usize) {
-        let mut idx = chunk.hash(key);
+        let mut idx = hash(key);
         let entry_size = mem::size_of::<EntryTemplate>();
         let cap = chunk.capacity;
         let base = chunk.base;
@@ -240,7 +242,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     fn modify_entry(&self, chunk: &Chunk<V, A, ALLOC>, key: usize, op: ModOp<V>) -> ModOutput {
         let cap = chunk.capacity;
         let base = chunk.base;
-        let mut idx = chunk.hash(key);
+        let mut idx = hash(key);
         let entry_size = mem::size_of::<EntryTemplate>();
         let mut replaced = None;
         let mut count = 0;
@@ -655,15 +657,6 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
     }
 
     #[inline]
-    fn hash(&self, mut num: usize) -> usize {
-        num ^= HASH_MAGIC_NUMBER;
-        num ^= num << 13;
-        num ^= num >> 17;
-        num ^= num << 5;
-        num
-    }
-
-    #[inline]
     fn cap_mask(&self) -> usize { self.capacity - 1  }
 }
 
@@ -719,6 +712,14 @@ fn entry_size() -> usize {
 #[inline(always)]
 fn chunk_size_of(cap: usize) -> usize {
     cap * entry_size()
+}
+
+#[inline(always)]
+pub  fn hash(mut num: usize) -> usize {
+    num ^= HASH_MAGIC_NUMBER_1;
+    num ^= (num ^ HASH_MAGIC_NUMBER_2) << 3;
+    num ^= (num ^ HASH_MAGIC_NUMBER_3) >> 5;
+    num
 }
 
 pub trait Attachment<V> {
