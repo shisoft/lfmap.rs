@@ -13,7 +13,7 @@ use core::cmp::Ordering;
 use core::iter::Copied;
 use core::marker::PhantomData;
 use core::ops::Deref;
-use core::ptr::NonNull;
+use core::ptr::{NonNull};
 use core::ptr::{drop_in_place, null, null_mut};
 use core::sync::atomic::Ordering::{Relaxed, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
@@ -68,6 +68,7 @@ pub struct Chunk<V, A: Attachment<V>, ALLOC: Alloc + Default> {
     occu_limit: usize,
     occupation: AtomicUsize,
     refs: AtomicUsize,
+    total_size: usize,
     attachment: A,
     shadow: PhantomData<(V, ALLOC)>,
 }
@@ -585,20 +586,34 @@ impl ParsedValue {
     }
 }
 
+pub fn align_padding(len: usize, align: usize) -> usize {
+    let len_rounded_up = len.wrapping_add(align).wrapping_sub(1) & !align.wrapping_sub(1);
+    len_rounded_up.wrapping_sub(len)
+}
+
 impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
     fn alloc_chunk(capacity: usize) -> *mut Self {
-        let base = alloc_mem::<ALLOC>(chunk_size_of(capacity));
-        let ptr = alloc_mem::<ALLOC>(mem::size_of::<Self>()) as *mut Self;
+        let self_size = mem::size_of::<Self>();
+        let self_align = align_padding(self_size, 64);
+        let self_size_aligned = self_size + self_align;
+        let chunk_size = chunk_size_of(capacity);
+        let attachment_heap = A::heap_size_of(capacity);
+        let total_size = self_size_aligned + chunk_size + attachment_heap;
+        let ptr = alloc_mem::<ALLOC>(total_size) as *mut Self;
+        let addr = ptr as usize;
+        let data_base = addr + self_size_aligned;
+        let attachment_base = data_base + chunk_size;
         unsafe {
             ptr::write(
                 ptr,
                 Self {
-                    base,
+                    base: data_base,
                     capacity,
                     occupation: AtomicUsize::new(0),
                     occu_limit: occupation_limit(capacity),
                     refs: AtomicUsize::new(1),
-                    attachment: A::new(capacity),
+                    total_size,
+                    attachment: A::new(capacity, attachment_base, attachment_heap),
                     shadow: PhantomData,
                 },
             )
@@ -635,8 +650,7 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Chunk<V, A, ALLOC> {
     unsafe fn gc(ptr: *mut Chunk<V, A, ALLOC>) {
         let chunk = &*ptr;
         chunk.attachment.dealloc();
-        dealloc_mem::<ALLOC>(chunk.base, chunk_size_of(chunk.capacity));
-        dealloc_mem::<ALLOC>(ptr as usize, mem::size_of::<Self>());
+        dealloc_mem::<ALLOC>(ptr as usize, chunk.total_size);
     }
 }
 
@@ -695,7 +709,8 @@ fn chunk_size_of(cap: usize) -> usize {
 }
 
 pub trait Attachment<V> {
-    fn new(cap: usize) -> Self;
+    fn heap_size_of(cap: usize) -> usize;
+    fn new(cap: usize, heap_ptr: usize, heap_size: usize) -> Self;
     fn get(&self, index: usize, key: usize) -> V;
     fn set(&self, index: usize, key: usize, att_value: V);
     fn erase(&self, index: usize, key: usize);
@@ -706,9 +721,9 @@ pub struct WordAttachment;
 
 // this attachment basically do nothing and sized zero
 impl Attachment<()> for WordAttachment {
-    fn new(cap: usize) -> Self {
-        Self
-    }
+    fn heap_size_of(cap: usize) -> usize { 0 }
+
+    fn new(cap: usize, heap_ptr: usize, heap_size: usize) -> Self { Self }
 
     #[inline(always)]
     fn get(&self, index: usize, key: usize) -> () {}
@@ -733,14 +748,16 @@ pub struct ObjectAttachment<T, A: Alloc + Default> {
 }
 
 impl<T: Clone, A: Alloc + Default> Attachment<T> for ObjectAttachment<T, A> {
-    fn new(cap: usize) -> Self {
+    fn heap_size_of(cap: usize) -> usize {
         let obj_size = mem::size_of::<T>();
-        let obj_chunk_size = cap * obj_size;
-        let addr = alloc_mem::<A>(obj_chunk_size);
+        cap * obj_size
+    }
+
+    fn new(cap: usize, heap_ptr: usize, heap_size: usize) -> Self {
         Self {
-            obj_chunk: addr,
-            size: obj_chunk_size,
-            obj_size,
+            obj_chunk: heap_ptr,
+            size: heap_size,
+            obj_size: mem::size_of::<T>(),
             shadow: PhantomData,
         }
     }
@@ -763,9 +780,7 @@ impl<T: Clone, A: Alloc + Default> Attachment<T> for ObjectAttachment<T, A> {
     }
 
     #[inline(always)]
-    fn dealloc(&self) {
-        dealloc_mem::<A>(self.obj_chunk, self.size);
-    }
+    fn dealloc(&self) {}
 }
 
 impl<T, A: Alloc + Default> ObjectAttachment<T, A> {
@@ -869,7 +884,7 @@ impl<ALLOC: Alloc + Default> Map<usize, usize> for WordMap<ALLOC> {
 
 #[inline(always)]
 fn alloc_mem<A: Alloc + Default>(size: usize) -> usize {
-    let align = mem::align_of::<EntryTemplate>();
+    let align = 64;
     let layout = Layout::from_size_align(size, align).unwrap();
     let mut alloc = A::default();
     // must be all zeroed
@@ -878,7 +893,7 @@ fn alloc_mem<A: Alloc + Default>(size: usize) -> usize {
 
 #[inline(always)]
 fn dealloc_mem<A: Alloc + Default + Default>(ptr: usize, size: usize) {
-    let align = mem::align_of::<EntryTemplate>();
+    let align = 64;
     let layout = Layout::from_size_align(size, align).unwrap();
     let mut alloc = A::default();
     unsafe { alloc.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
