@@ -902,7 +902,9 @@ fn alloc_mem<A: Alloc + Default>(size: usize) -> usize {
     let layout = Layout::from_size_align(size, align).unwrap();
     let mut alloc = A::default();
     // must be all zeroed
-    unsafe { alloc.alloc_zeroed(layout) }.unwrap().as_ptr() as usize
+    let addr = unsafe { alloc.alloc_zeroed(layout) }.unwrap().as_ptr() as usize;
+    debug_assert_eq!(addr % 64, 0);
+    addr
 }
 
 #[inline(always)]
