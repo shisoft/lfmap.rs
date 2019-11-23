@@ -27,9 +27,6 @@ pub type EntryTemplate = (usize, usize);
 const EMPTY_KEY: usize = 0;
 const EMPTY_VALUE: usize = 0;
 const SENTINEL_VALUE: usize = 1;
-const HASH_MAGIC_NUMBER_1: usize = 67280421310721;
-const HASH_MAGIC_NUMBER_2: usize = 123456789;
-const HASH_MAGIC_NUMBER_3: usize = 362436069;
 
 struct Value {
     raw: usize,
