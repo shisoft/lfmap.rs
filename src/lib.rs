@@ -930,3 +930,9 @@ impl Hasher for PassthroughHasher {
         self.num = i as u64
     }
 }
+
+impl Default for PassthroughHasher {
+    fn default() -> Self {
+        Self { num: 0 }
+    }
+}
