@@ -912,3 +912,21 @@ fn dealloc_mem<A: Alloc + Default + Default>(ptr: usize, size: usize) {
     let mut alloc = A::default();
     unsafe { alloc.dealloc(NonNull::<u8>::new(ptr as *mut u8).unwrap(), layout) }
 }
+
+pub struct PassthroughHasher {
+    num: u64
+}
+
+impl Hasher for PassthroughHasher {
+    fn finish(&self) -> u64 {
+        self.num
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        unimplemented!()
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.num = i as u64
+    }
+}
