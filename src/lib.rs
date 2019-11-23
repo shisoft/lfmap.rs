@@ -19,6 +19,8 @@ use core::sync::atomic::Ordering::{Relaxed, SeqCst};
 use core::sync::atomic::{fence, AtomicBool, AtomicPtr, AtomicUsize};
 use core::{intrinsics, mem, ptr};
 use ModOp::Empty;
+use core::hash::Hasher;
+use seahash::SeaHasher;
 
 pub type EntryTemplate = (usize, usize);
 
@@ -80,14 +82,15 @@ pub struct ChunkRef<V, A: Attachment<V>, ALLOC: Alloc + Default> {
     ptr: *mut Chunk<V, A, ALLOC>,
 }
 
-pub struct Table<V, A: Attachment<V>, ALLOC: Alloc + Default> {
+pub struct Table<V, A: Attachment<V>, ALLOC: Alloc + Default, H: Hasher + Default> {
     old_chunk: AtomicPtr<Chunk<V, A, ALLOC>>,
     new_chunk: AtomicPtr<Chunk<V, A, ALLOC>>,
     val_bit_mask: usize, // 0111111..
     inv_bit_mask: usize, // 1000000..
+    mark: PhantomData<H>
 }
 
-impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
+impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default, H: Hasher + Default> Table<V, A, ALLOC, H> {
     pub fn with_capacity(cap: usize) -> Self {
         if !is_power_of_2(cap) {
             panic!("capacity is not power of 2");
@@ -101,6 +104,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
             new_chunk: AtomicPtr::new(chunk),
             val_bit_mask,
             inv_bit_mask: !val_bit_mask,
+            mark: PhantomData
         }
     }
 
@@ -211,7 +215,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     }
 
     fn get_from_chunk(&self, chunk: &Chunk<V, A, ALLOC>, key: usize) -> (Value, usize) {
-        let mut idx = hash(key);
+        let mut idx = hash::<H>(key);
         let entry_size = mem::size_of::<EntryTemplate>();
         let cap = chunk.capacity;
         let base = chunk.base;
@@ -242,7 +246,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     fn modify_entry(&self, chunk: &Chunk<V, A, ALLOC>, key: usize, op: ModOp<V>) -> ModOutput {
         let cap = chunk.capacity;
         let base = chunk.base;
-        let mut idx = hash(key);
+        let mut idx = hash::<H>(key);
         let entry_size = mem::size_of::<EntryTemplate>();
         let mut replaced = None;
         let mut count = 0;
@@ -538,7 +542,7 @@ impl<V: Clone, A: Attachment<V>, ALLOC: Alloc + Default> Table<V, A, ALLOC> {
     }
 }
 
-impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for Table<V, A, ALLOC> {
+impl<V, A: Attachment<V>, ALLOC: Alloc + Default, H: Hasher + Default> Drop for Table<V, A, ALLOC, H> {
     fn drop(&mut self) {
         let old_chunk = self.old_chunk.load(Relaxed);
         let new_chunk = self.new_chunk.load(Relaxed);
@@ -554,9 +558,9 @@ impl<V, A: Attachment<V>, ALLOC: Alloc + Default> Drop for Table<V, A, ALLOC> {
 }
 
 impl Value {
-    pub fn new<V, A: Attachment<V>, ALLOC: Alloc + Default>(
+    pub fn new<V, A: Attachment<V>, ALLOC: Alloc + Default, H: Hasher + Default>(
         val: usize,
-        table: &Table<V, A, ALLOC>,
+        table: &Table<V, A, ALLOC, H>,
     ) -> Self {
         let res = {
             if val == 0 {
@@ -715,8 +719,10 @@ fn chunk_size_of(cap: usize) -> usize {
 }
 
 #[inline(always)]
-pub  fn hash(mut num: usize) -> usize {
-    seahash::hash(&num.to_ne_bytes()) as usize
+pub  fn hash<H: Hasher + Default>(num: usize) -> usize {
+    let mut hasher = H::default();
+    hasher.write_usize(num);
+    hasher.finish() as usize
 }
 
 pub trait Attachment<V> {
@@ -749,7 +755,7 @@ impl Attachment<()> for WordAttachment {
     fn dealloc(&self) {}
 }
 
-pub type WordTable<ALLOC: Alloc + Default> = Table<(), WordAttachment, ALLOC>;
+pub type WordTable<H: Hasher + Default, ALLOC: Alloc + Default> = Table<(), WordAttachment, H, ALLOC>;
 
 pub struct ObjectAttachment<T, A: Alloc + Default> {
     obj_chunk: usize,
@@ -811,11 +817,11 @@ pub trait Map<K, V> {
 
 const NUM_KEY_FIX: usize = 5;
 
-pub struct ObjectMap<V: Clone, ALLOC: Alloc + Default = Global> {
-    table: Table<V, ObjectAttachment<V, ALLOC>, ALLOC>,
+pub struct ObjectMap<V: Clone, ALLOC: Alloc + Default = Global, H: Hasher + Default = SeaHasher> {
+    table: Table<V, ObjectAttachment<V, ALLOC>, ALLOC, H>,
 }
 
-impl<V: Clone, ALLOC: Alloc + Default> Map<usize, V> for ObjectMap<V, ALLOC> {
+impl<V: Clone, ALLOC: Alloc + Default, H: Hasher + Default> Map<usize, V> for ObjectMap<V, ALLOC, H> {
     fn with_capacity(cap: usize) -> Self {
         Self {
             table: Table::with_capacity(cap),
@@ -854,11 +860,11 @@ impl<V: Clone, ALLOC: Alloc + Default> Map<usize, V> for ObjectMap<V, ALLOC> {
     }
 }
 
-pub struct WordMap<ALLOC: Alloc + Default = Global> {
-    table: WordTable<ALLOC>,
+pub struct WordMap<ALLOC: Alloc + Default = Global, H: Hasher + Default = SeaHasher> {
+    table: WordTable<ALLOC, H>,
 }
 
-impl<ALLOC: Alloc + Default> Map<usize, usize> for WordMap<ALLOC> {
+impl<ALLOC: Alloc + Default, H: Hasher + Default> Map<usize, usize> for WordMap<ALLOC, H> {
     fn with_capacity(cap: usize) -> Self {
         Self {
             table: Table::with_capacity(cap),
